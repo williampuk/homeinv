@@ -18,10 +18,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Syntax check browser files
+      - name: Syntax check synchronization files
         run: |
           node --check sync-v3-core.js
           node --check sync-v3.js
           node --check service-worker.js
-      - name: Run sync core tests
+          cp GoogleSheetSync.gs /tmp/GoogleSheetSync.js
+          node --check /tmp/GoogleSheetSync.js
+      - name: Run browser sync core tests
         run: node tests/sync-v3-core.test.js
+      - name: Run Apps Script sync tests
+        run: |
+          cp GoogleSheetSync.gs GoogleSheetSync.js
+          node tests/google-sheet-sync-v3.test.js
