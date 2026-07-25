@@ -17,6 +17,9 @@
     HOUSEHOLD_SETTINGS_PUT: 'HOUSEHOLD_SETTINGS_PUT'
   };
 
+  var _lastOpMs = 0;
+  var _opCounter = 0;
+
   function clone(value) {
     if (value == null) return value;
     return JSON.parse(JSON.stringify(value));
@@ -68,14 +71,26 @@
     return copy;
   }
 
-  function makeOpId(deviceId) {
-    return 'op_' + deviceId + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+  function nextLocalOrder() {
+    var now = Date.now();
+    if (now !== _lastOpMs) {
+      _lastOpMs = now;
+      _opCounter = 0;
+    } else {
+      _opCounter += 1;
+    }
+    return now * 1000 + _opCounter;
+  }
+
+  function makeOpId(deviceId, localOrder) {
+    return 'op_' + deviceId + '_' + Number(localOrder || nextLocalOrder()).toString(36) + '_' + Math.random().toString(36).slice(2, 10);
   }
 
   function makeOperation(input) {
     input = input || {};
+    var localOrder = Number(input.localOrder || nextLocalOrder());
     return {
-      opId: input.opId || makeOpId(input.deviceId || 'device'),
+      opId: input.opId || makeOpId(input.deviceId || 'device', localOrder),
       type: input.type,
       entityType: input.entityType,
       entityId: input.entityId || '',
@@ -83,8 +98,9 @@
       dependsOnOpId: input.dependsOnOpId || null,
       deviceId: input.deviceId || '',
       createdAt: input.createdAt || new Date().toISOString(),
+      localOrder: localOrder,
       payload: clone(input.payload || {}),
-      status: 'pending'
+      status: input.status || 'pending'
     };
   }
 
@@ -113,6 +129,11 @@
   }
 
   function stockEntryPut(itemId, entry, baseVersion, initialQuantity, deviceId, dependency) {
+    var payload = {
+      itemId: itemId,
+      entry: stripEntryServerFields(entry)
+    };
+    if (Number(baseVersion || 0) === 0) payload.initialQuantity = Number(initialQuantity || 0);
     return makeOperation({
       type: OP_TYPES.STOCK_ENTRY_PUT,
       entityType: 'stockEntry',
@@ -120,11 +141,7 @@
       baseVersion: baseVersion,
       deviceId: deviceId,
       dependsOnOpId: dependency || null,
-      payload: {
-        itemId: itemId,
-        entry: stripEntryServerFields(entry),
-        initialQuantity: baseVersion === 0 ? Number(initialQuantity || 0) : undefined
-      }
+      payload: payload
     });
   }
 
@@ -196,6 +213,42 @@
     });
   }
 
+  function operationOrder(a, b) {
+    var ao = Number(a && a.localOrder || 0);
+    var bo = Number(b && b.localOrder || 0);
+    if (ao !== bo) return ao - bo;
+    var at = String(a && a.createdAt || '');
+    var bt = String(b && b.createdAt || '');
+    if (at !== bt) return at.localeCompare(bt);
+    return String(a && a.opId || '').localeCompare(String(b && b.opId || ''));
+  }
+
+  function sortOperations(operations) {
+    var list = (operations || []).slice().sort(operationOrder);
+    var byId = {};
+    list.forEach(function(op) { if (op && op.opId) byId[op.opId] = op; });
+    var visiting = {};
+    var visited = {};
+    var output = [];
+
+    function visit(op) {
+      if (!op || !op.opId || visited[op.opId]) return;
+      if (visiting[op.opId]) {
+        // A dependency cycle is invalid. Preserve deterministic order and let the
+        // server reject/block it instead of recursing forever.
+        return;
+      }
+      visiting[op.opId] = true;
+      if (op.dependsOnOpId && byId[op.dependsOnOpId]) visit(byId[op.dependsOnOpId]);
+      visiting[op.opId] = false;
+      visited[op.opId] = true;
+      output.push(op);
+    }
+
+    list.forEach(visit);
+    return output;
+  }
+
   function applyProjectedOperation(state, op) {
     state = state || {};
     state.inventory = state.inventory || [];
@@ -211,7 +264,8 @@
           item = Object.assign({}, clone(payload.item || {}), {
             id: op.entityId,
             version: Math.max(1, Number(op.baseVersion || 0) + 1),
-            stockEntries: []
+            stockEntries: [],
+            deletedAt: null
           });
           state.inventory.push(item);
         } else {
@@ -231,7 +285,7 @@
         break;
       case OP_TYPES.STOCK_ENTRY_PUT:
         item = findItem(state, payload.itemId);
-        if (!item) break;
+        if (!item || item.deletedAt) break;
         item.stockEntries = item.stockEntries || [];
         index = item.stockEntries.findIndex(function(candidate) { return candidate.id === op.entityId; });
         if (index < 0) {
@@ -243,11 +297,12 @@
           }));
         } else {
           entry = item.stockEntries[index];
+          if (entry.hiddenAt) break;
           item.stockEntries[index] = Object.assign({}, entry, clone(payload.entry || {}), {
             id: op.entityId,
             quantity: Number(entry.quantity || 0),
             version: Math.max(Number(entry.version || 0), Number(op.baseVersion || 0) + 1),
-            hiddenAt: entry.hiddenAt || null
+            hiddenAt: null
           });
         }
         item.quantity = stockTotal(item);
@@ -261,7 +316,7 @@
       case OP_TYPES.STOCK_ADJUST:
         item = findItem(state, payload.itemId);
         entry = findEntry(item, payload.entryId);
-        if (entry) entry.quantity = Number(entry.quantity || 0) + Number(payload.delta || 0);
+        if (entry && !entry.hiddenAt) entry.quantity = Number(entry.quantity || 0) + Number(payload.delta || 0);
         if (item) item.quantity = stockTotal(item);
         break;
       case OP_TYPES.LOCATIONS_PUT:
@@ -283,11 +338,9 @@
 
   function projectState(canonical, operations) {
     var projected = clone(canonical || {});
-    (operations || []).filter(function(op) {
+    sortOperations((operations || []).filter(function(op) {
       return !op.status || ['pending', 'retry', 'conflict', 'blocked'].indexOf(op.status) !== -1;
-    }).sort(function(a, b) {
-      return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
-    }).forEach(function(op) {
+    })).forEach(function(op) {
       applyProjectedOperation(projected, op);
     });
     return projected;
@@ -296,11 +349,8 @@
   function latestDependency(ops, entityType, entityId) {
     var matching = (ops || []).filter(function(op) {
       return op.entityType === entityType && op.entityId === entityId &&
-        ['applied', 'duplicate', 'rejected'].indexOf(op.status) === -1;
-    });
-    matching.sort(function(a, b) {
-      return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
-    });
+        ['pending', 'retry'].indexOf(op.status || 'pending') !== -1;
+    }).sort(operationOrder);
     return matching.length ? matching[matching.length - 1] : null;
   }
 
@@ -311,11 +361,12 @@
   }
 
   function operationResultAction(result) {
-    if (!result) return 'retain';
+    if (!result) return 'retry';
     if (result.status === 'applied' || result.status === 'duplicate') return 'delete';
     if (result.status === 'conflict') return 'conflict';
     if (result.status === 'blocked') return 'blocked';
-    return 'rejected';
+    if (result.status === 'rejected') return 'rejected';
+    return 'retry';
   }
 
   return {
@@ -334,6 +385,8 @@
     locationsPut: locationsPut,
     categoriesPut: categoriesPut,
     householdSettingsPut: householdSettingsPut,
+    operationOrder: operationOrder,
+    sortOperations: sortOperations,
     applyProjectedOperation: applyProjectedOperation,
     projectState: projectState,
     latestDependency: latestDependency,
