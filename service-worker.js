@@ -1,8 +1,12 @@
 /**
- * Find My Item — Service Worker
- * Cache-first for app shell, network-first for nav, stale-while-revalidate for assets.
+ * Find My Item service worker.
+ *
+ * Protocol v3 is injected after app.js so the existing application can be
+ * upgraded without duplicating the large legacy app bundle. The injection is
+ * synchronous while the HTML parser is at the app.js script tag, therefore the
+ * v3 functions replace the legacy sync functions before DOMContentLoaded.
  */
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4-sync3';
 const APP_SHELL_CACHE = 'fmi-shell-' + CACHE_VERSION;
 const STATIC_CACHE = 'fmi-static-' + CACHE_VERSION;
 const CDN_CACHE = 'fmi-cdn-' + CACHE_VERSION;
@@ -12,6 +16,8 @@ const APP_SHELL = [
   './index.html',
   './style.css',
   './app.js',
+  './sync-v3-core.js',
+  './sync-v3.js',
   './manifest.json'
 ];
 
@@ -23,136 +29,114 @@ const CDN_URLS = [
 ];
 
 self.addEventListener('install', function(event) {
-  console.log('[SW] Install — caching app shell');
   event.waitUntil(
     caches.open(APP_SHELL_CACHE).then(function(cache) {
       return cache.addAll(APP_SHELL);
     }).then(function() {
       return caches.open(CDN_CACHE).then(function(cache) {
-        return Promise.allSettled(
-          CDN_URLS.map(function(url) {
-            return fetch(url, { mode: 'no-cors' }).then(function(resp) {
-              if (resp.ok || resp.type === 'opaque') {
-                return cache.put(url, resp);
-              }
-            }).catch(function() {
-              console.warn('[SW] CDN pre-cache failed (will retry on use):', url);
-            });
-          })
-        );
+        return Promise.allSettled(CDN_URLS.map(function(url) {
+          return fetch(url, { mode: 'no-cors' }).then(function(resp) {
+            if (resp.ok || resp.type === 'opaque') return cache.put(url, resp);
+          }).catch(function() {});
+        }));
       });
-    }).then(function() {
-      return self.skipWaiting();
-    })
+    }).then(function() { return self.skipWaiting(); })
   );
 });
 
 self.addEventListener('activate', function(event) {
-  console.log('[SW] Activate — cleaning old caches');
   event.waitUntil(
     caches.keys().then(function(keys) {
-      return Promise.all(
-        keys.filter(function(k) {
-          return k.startsWith('fmi-') &&
-                 k !== APP_SHELL_CACHE &&
-                 k !== STATIC_CACHE &&
-                 k !== CDN_CACHE;
-        }).map(function(k) {
-          console.log('[SW] Deleting old cache:', k);
-          return caches.delete(k);
-        })
-      );
-    }).then(function() {
-      return self.clients.claim();
-    })
+      return Promise.all(keys.filter(function(key) {
+        return key.indexOf('fmi-') === 0 &&
+          key !== APP_SHELL_CACHE && key !== STATIC_CACHE && key !== CDN_CACHE;
+      }).map(function(key) { return caches.delete(key); }));
+    }).then(function() { return self.clients.claim(); })
   );
 });
+
+function appJsResponse(request) {
+  return fetch(request).then(function(response) {
+    if (response && response.ok) {
+      caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put(request, response.clone()); });
+      return response;
+    }
+    throw new Error('app.js network response unavailable');
+  }).catch(function() {
+    return caches.match(request);
+  }).then(function(response) {
+    if (!response) return new Response('throw new Error("app.js unavailable");', { headers: { 'Content-Type': 'application/javascript' } });
+    return response.text().then(function(source) {
+      var loader = '\n;document.write(\'<script src="./sync-v3-core.js?v=3"><\\/script><script src="./sync-v3.js?v=3"><\\/script>\');\n';
+      return new Response(source + loader, {
+        status: 200,
+        headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }
+      });
+    });
+  });
+}
 
 self.addEventListener('fetch', function(event) {
   var url = new URL(event.request.url);
+  if (event.request.method !== 'GET' || url.protocol === 'chrome-extension:') return;
 
-  // Skip non-GET requests and chrome-extension requests
-  if (event.request.method !== 'GET') return;
-  if (url.protocol === 'chrome-extension:') return;
-
-  // CDN resources: cache-first (or stale-while-revalidate if already cached)
-  if (CDN_URLS.some(function(cdn) { return url.href.startsWith(cdn) || url.href.replace(/@[\d.]+/g, '').startsWith(cdn.replace(/@[\d.]+/g, '')); })) {
-    event.respondWith(
-      caches.match(event.request).then(function(cached) {
-        var fetchPromise = fetch(event.request).then(function(netResp) {
-          if (netResp && netResp.status === 200) {
-            var clone = netResp.clone();
-            caches.open(CDN_CACHE).then(function(cache) {
-              cache.put(event.request, clone);
-            });
-          }
-          return netResp;
-        }).catch(function() {
-          return cached;
-        });
-        return cached || fetchPromise;
-      })
-    );
+  if (url.origin === self.location.origin && /\/app\.js$/.test(url.pathname)) {
+    event.respondWith(appJsResponse(event.request));
     return;
   }
 
-  // App shell files: cache-first
-  if (APP_SHELL.some(function(s) { return url.pathname.endsWith(s.replace('./', '')); })) {
-    event.respondWith(
-      caches.match(event.request).then(function(cached) {
-        return cached || fetch(event.request).then(function(netResp) {
-          if (netResp && netResp.status === 200) {
-            var clone = netResp.clone();
-            caches.open(APP_SHELL_CACHE).then(function(cache) {
-              cache.put(event.request, clone);
-            });
-          }
-          return netResp;
-        });
-      })
-    );
-    return;
-  }
-
-  // Navigation requests (HTML): network-first, fallback to cached index
-  if (event.request.mode === 'navigate') {
-    event.respondWith(
-      fetch(event.request).catch(function() {
-        return caches.match('./index.html').then(function(cached) {
-          if (cached) return cached;
-          return caches.match('./').then(function(root) {
-            return root || new Response('Offline — please connect to the internet.', {
-              status: 503,
-              headers: { 'Content-Type': 'text/plain' }
-            });
-          });
-        });
-      })
-    );
-    return;
-  }
-
-  // All other static assets: stale-while-revalidate
-  event.respondWith(
-    caches.match(event.request).then(function(cached) {
-      var fetchPromise = fetch(event.request).then(function(netResp) {
-        if (netResp && netResp.status === 200) {
-          var clone = netResp.clone();
-          caches.open(STATIC_CACHE).then(function(cache) {
-            cache.put(event.request, clone);
-          });
+  if (CDN_URLS.some(function(cdn) {
+    return url.href.indexOf(cdn) === 0 || url.href.replace(/@[\d.]+/g, '').indexOf(cdn.replace(/@[\d.]+/g, '')) === 0;
+  })) {
+    event.respondWith(caches.match(event.request).then(function(cached) {
+      var network = fetch(event.request).then(function(response) {
+        if (response && response.status === 200) {
+          caches.open(CDN_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
         }
-        return netResp;
-      }).catch(function() {
-        return cached;
+        return response;
+      }).catch(function() { return cached; });
+      return cached || network;
+    }));
+    return;
+  }
+
+  if (event.request.mode === 'navigate') {
+    event.respondWith(fetch(event.request).then(function(response) {
+      if (response && response.ok) {
+        caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put('./index.html', response.clone()); });
+      }
+      return response;
+    }).catch(function() {
+      return caches.match('./index.html').then(function(cached) {
+        return cached || caches.match('./') || new Response('Offline', { status: 503 });
       });
-      return cached || fetchPromise;
-    })
-  );
+    }));
+    return;
+  }
+
+  if (APP_SHELL.some(function(path) { return url.pathname.endsWith(path.replace('./', '')); })) {
+    event.respondWith(caches.match(event.request).then(function(cached) {
+      return cached || fetch(event.request).then(function(response) {
+        if (response && response.ok) {
+          caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
+        }
+        return response;
+      });
+    }));
+    return;
+  }
+
+  event.respondWith(caches.match(event.request).then(function(cached) {
+    var network = fetch(event.request).then(function(response) {
+      if (response && response.ok) {
+        caches.open(STATIC_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
+      }
+      return response;
+    }).catch(function() { return cached; });
+    return cached || network;
+  }));
 });
 
 self.addEventListener('message', function(event) {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
