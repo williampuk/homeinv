@@ -73,12 +73,38 @@ test('only applied and duplicate results delete outbox entries', function() {
   assert.equal(Core.operationResultAction({ status: 'conflict' }), 'conflict');
   assert.equal(Core.operationResultAction({ status: 'rejected' }), 'rejected');
   assert.equal(Core.operationResultAction({ status: 'blocked' }), 'blocked');
+  assert.equal(Core.operationResultAction(null), 'retry');
 });
 
 test('dependent version advances from predecessor base version', function() {
   const previous = Core.itemPut({ id: 'item-1', name: 'A' }, 4, 'dev-a');
   assert.equal(Core.nextBaseVersion(4, previous), 5);
   assert.equal(Core.latestDependency([previous], 'item', 'item-1').opId, previous.opId);
+});
+
+test('operation sort always places dependencies first', function() {
+  const parent = Core.itemPut({ id: 'new-item', name: 'New', itemType: 'stock' }, 0, 'dev-a');
+  const child = Core.stockEntryPut('new-item', { id: 'entry-new', segment: 'Kitchen' }, 0, 5, 'dev-a', parent.opId);
+  child.localOrder = parent.localOrder - 1;
+  const sorted = Core.sortOperations([child, parent]);
+  assert.deepEqual(sorted.map(op => op.opId), [parent.opId, child.opId]);
+});
+
+test('conflicted operations remain projected but rejected operations do not', function() {
+  const conflict = Core.itemPut({ id: 'item-1', name: 'Local conflict' }, 4, 'dev-a');
+  conflict.status = 'conflict';
+  const rejected = Core.itemPut({ id: 'item-1', name: 'Rejected' }, 4, 'dev-a');
+  rejected.status = 'rejected';
+  const projected = Core.projectState(snapshot(), [conflict, rejected]);
+  assert.equal(projected.inventory[0].name, 'Local conflict');
+});
+
+test('latest dependency ignores resolved and conflicted operations', function() {
+  const applied = Core.itemPut({ id: 'item-1', name: 'A' }, 4, 'dev-a');
+  applied.status = 'applied';
+  const conflict = Core.itemPut({ id: 'item-1', name: 'B' }, 4, 'dev-a');
+  conflict.status = 'conflict';
+  assert.equal(Core.latestDependency([applied, conflict], 'item', 'item-1'), null);
 });
 
 console.log('All sync v3 core tests passed.');
