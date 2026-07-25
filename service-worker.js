@@ -1,12 +1,12 @@
 /**
  * Find My Item service worker.
  *
- * Protocol v3 is injected after app.js so the existing application can be
- * upgraded without duplicating the large legacy app bundle. The injection is
- * synchronous while the HTML parser is at the app.js script tag, therefore the
- * v3 functions replace the legacy sync functions before DOMContentLoaded.
+ * The legacy UI remains in app.js. For controlled pages, the service worker
+ * returns a deterministic concatenation of app.js, sync-v3-core.js, and
+ * sync-v3.js so protocol v3 overrides are installed synchronously before
+ * DOMContentLoaded without document.write or asynchronous script races.
  */
-const CACHE_VERSION = 'v4-sync3';
+const CACHE_VERSION = 'v5-sync3-review';
 const APP_SHELL_CACHE = 'fmi-shell-' + CACHE_VERSION;
 const STATIC_CACHE = 'fmi-static-' + CACHE_VERSION;
 const CDN_CACHE = 'fmi-cdn-' + CACHE_VERSION;
@@ -35,12 +35,14 @@ self.addEventListener('install', function(event) {
     }).then(function() {
       return caches.open(CDN_CACHE).then(function(cache) {
         return Promise.allSettled(CDN_URLS.map(function(url) {
-          return fetch(url, { mode: 'no-cors' }).then(function(resp) {
-            if (resp.ok || resp.type === 'opaque') return cache.put(url, resp);
+          return fetch(url, { mode: 'no-cors' }).then(function(response) {
+            if (response.ok || response.type === 'opaque') return cache.put(url, response);
           }).catch(function() {});
         }));
       });
-    }).then(function() { return self.skipWaiting(); })
+    }).then(function() {
+      return self.skipWaiting();
+    })
   );
 });
 
@@ -50,28 +52,57 @@ self.addEventListener('activate', function(event) {
       return Promise.all(keys.filter(function(key) {
         return key.indexOf('fmi-') === 0 &&
           key !== APP_SHELL_CACHE && key !== STATIC_CACHE && key !== CDN_CACHE;
-      }).map(function(key) { return caches.delete(key); }));
-    }).then(function() { return self.clients.claim(); })
+      }).map(function(key) {
+        return caches.delete(key);
+      }));
+    }).then(function() {
+      return self.clients.claim();
+    })
   );
 });
 
-function appJsResponse(request) {
+function networkThenCache(request, cacheName) {
   return fetch(request).then(function(response) {
     if (response && response.ok) {
-      caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put(request, response.clone()); });
+      caches.open(cacheName).then(function(cache) {
+        cache.put(request, response.clone());
+      });
       return response;
     }
-    throw new Error('app.js network response unavailable');
+    throw new Error('Network response unavailable');
   }).catch(function() {
     return caches.match(request);
-  }).then(function(response) {
-    if (!response) return new Response('throw new Error("app.js unavailable");', { headers: { 'Content-Type': 'application/javascript' } });
-    return response.text().then(function(source) {
-      var loader = '\n;document.write(\'<script src="./sync-v3-core.js?v=3"><\\/script><script src="./sync-v3.js?v=3"><\\/script>\');\n';
-      return new Response(source + loader, {
-        status: 200,
-        headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }
-      });
+  });
+}
+
+function getScriptText(path) {
+  var request = new Request(path, { method: 'GET', credentials: 'same-origin' });
+  return networkThenCache(request, APP_SHELL_CACHE).then(function(response) {
+    if (!response) throw new Error(path + ' unavailable');
+    return response.text();
+  });
+}
+
+function bundledAppResponse() {
+  return Promise.all([
+    getScriptText('./app.js'),
+    getScriptText('./sync-v3-core.js'),
+    getScriptText('./sync-v3.js')
+  ]).then(function(parts) {
+    var source = parts[0] +
+      '\n;/* bundled sync-v3-core.js */\n' + parts[1] +
+      '\n;/* bundled sync-v3.js */\n' + parts[2] + '\n';
+    return new Response(source, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  }).catch(function(error) {
+    return new Response('console.error(' + JSON.stringify('[SW] Application bundle unavailable: ' + error.message) + ');', {
+      status: 503,
+      headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
     });
   });
 }
@@ -81,20 +112,25 @@ self.addEventListener('fetch', function(event) {
   if (event.request.method !== 'GET' || url.protocol === 'chrome-extension:') return;
 
   if (url.origin === self.location.origin && /\/app\.js$/.test(url.pathname)) {
-    event.respondWith(appJsResponse(event.request));
+    event.respondWith(bundledAppResponse());
     return;
   }
 
   if (CDN_URLS.some(function(cdn) {
-    return url.href.indexOf(cdn) === 0 || url.href.replace(/@[\d.]+/g, '').indexOf(cdn.replace(/@[\d.]+/g, '')) === 0;
+    return url.href.indexOf(cdn) === 0 ||
+      url.href.replace(/@[\d.]+/g, '').indexOf(cdn.replace(/@[\d.]+/g, '')) === 0;
   })) {
     event.respondWith(caches.match(event.request).then(function(cached) {
       var network = fetch(event.request).then(function(response) {
         if (response && response.status === 200) {
-          caches.open(CDN_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
+          caches.open(CDN_CACHE).then(function(cache) {
+            cache.put(event.request, response.clone());
+          });
         }
         return response;
-      }).catch(function() { return cached; });
+      }).catch(function() {
+        return cached;
+      });
       return cached || network;
     }));
     return;
@@ -103,25 +139,27 @@ self.addEventListener('fetch', function(event) {
   if (event.request.mode === 'navigate') {
     event.respondWith(fetch(event.request).then(function(response) {
       if (response && response.ok) {
-        caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put('./index.html', response.clone()); });
+        caches.open(APP_SHELL_CACHE).then(function(cache) {
+          cache.put('./index.html', response.clone());
+        });
       }
       return response;
     }).catch(function() {
       return caches.match('./index.html').then(function(cached) {
-        return cached || caches.match('./') || new Response('Offline', { status: 503 });
+        if (cached) return cached;
+        return caches.match('./').then(function(root) {
+          return root || new Response('Offline', { status: 503 });
+        });
       });
     }));
     return;
   }
 
-  if (APP_SHELL.some(function(path) { return url.pathname.endsWith(path.replace('./', '')); })) {
+  if (APP_SHELL.some(function(path) {
+    return url.pathname.endsWith(path.replace('./', ''));
+  })) {
     event.respondWith(caches.match(event.request).then(function(cached) {
-      return cached || fetch(event.request).then(function(response) {
-        if (response && response.ok) {
-          caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
-        }
-        return response;
-      });
+      return cached || networkThenCache(event.request, APP_SHELL_CACHE);
     }));
     return;
   }
@@ -129,10 +167,14 @@ self.addEventListener('fetch', function(event) {
   event.respondWith(caches.match(event.request).then(function(cached) {
     var network = fetch(event.request).then(function(response) {
       if (response && response.ok) {
-        caches.open(STATIC_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
+        caches.open(STATIC_CACHE).then(function(cache) {
+          cache.put(event.request, response.clone());
+        });
       }
       return response;
-    }).catch(function() { return cached; });
+    }).catch(function() {
+      return cached;
+    });
     return cached || network;
   }));
 });
