@@ -1,1139 +1,533 @@
-/**
- * Home Inventory & Posting Manager — Google Apps Script Backend
- * Deploy as a Web App (Execute as: Me, Access: Anyone).
- * Paste the deployment URL into the app's Cloud Engine tab.
- *
- * Actions:
- *   GET  ?token=X&action=SYNC_PULL        → returns full app state JSON
- *   POST token=X&action=SYNC_PUSH&payload=...  → stores full state snapshot
- *   POST token=X&action=overwrite&sheetName=...&data=... → writes to a specific sheet
- *   POST token=X&action=SEND_REMINDERS&payload=... → client-initiated reminder dispatch
- *
- * Writable sheets (overwrite action): Records, Colleagues, Posts
- * Reminder functions: checkAndRemind, setupTimeTrigger (time-driven, runs ~7 AM daily)
- *
- * Schema version: 2.1.0
- */
-
-// ─── Configuration ──────────────────────────────────────────────────────────
-
 var CONFIG = {
-  schemaVersion: '2.1.0',
-  // The shared secret must match the front-end localStorage key 'sys_api_pwd'.
-  // Default on first run: 'secretToken123' — change this and update the front end.
-  secretToken: 'secretToken123',
-
-  // Main data sheet (monolithic JSON blob for SYNC_PULL / SYNC_PUSH).
-  dataSheet: 'Data',
-
-  // Cell content size limit to stay under Google Sheets 50K limit with safety margin.
-  maxCellSize: 40000
+  protocolVersion: 3,
+  schemaVersion: '3.0.0',
+  maxCellSize: 40000,
+  maxOperations: 100,
+  maxRequestChars: 500000,
+  secretProperty: 'SYNC_SECRET_TOKEN'
 };
 
-// ─── Entry Points ───────────────────────────────────────────────────────────
-
-function doGet(e)  { return handleRequest(e); }
+function doGet(e) { return handleRequest(e); }
 function doPost(e) { return handleRequest(e); }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/**
- * Wraps an object as a JSON HTTP response.
- * Supports optional JSONP callback for cross-origin environments.
- */
-function jsonResponse(data, jsonpCallback) {
-  var body = JSON.stringify(data);
-  if (jsonpCallback) {
-    return ContentService.createTextOutput(jsonpCallback + '(' + body + ')')
-      .setMimeType(ContentService.MimeType.JAVASCRIPT);
-  }
-  return ContentService.createTextOutput(body)
+function jsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-/**
- * Validates the shared secret token.
- * Returns { valid: boolean, errorMessage: string }.
- */
+function fail(code, message, retryable, extra) {
+  var out = { success: false, errorCode: code, message: message || code, retryable: !!retryable };
+  Object.keys(extra || {}).forEach(function(k) { out[k] = extra[k]; });
+  return out;
+}
+
+function getSecretToken() {
+  return PropertiesService.getScriptProperties().getProperty(CONFIG.secretProperty) || '';
+}
+
 function validatePassword(token) {
-  if (!token) {
-    return { valid: false, errorMessage: 'Missing authentication token.' };
-  }
-  if (token !== CONFIG.secretToken) {
-    return { valid: false, errorMessage: 'Invalid authentication token.' };
-  }
-  return { valid: true, errorMessage: '' };
+  var expected = getSecretToken();
+  if (!expected) return fail('AUTH_FAILED', 'Server sync secret is not configured.', false);
+  if (!token || token !== expected) return fail('AUTH_FAILED', 'Invalid authentication token.', false);
+  return null;
 }
 
-/**
- * Ensures the required sheet exists, creating it if needed.
- */
-function ensureSheet(sheetName) {
+function ensureSheet(name, headers) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(sheetName);
-  if (!sheet) sheet = ss.insertSheet(sheetName);
-  return sheet;
-}
-
-/**
- * Ensures an Ops sheet exists (append-only audit log).
- */
-function ensureOpsSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('Ops');
-  if (!sheet) {
-    sheet = ss.insertSheet('Ops');
-    sheet.getRange(1, 1, 1, 8).setValues([['seq', 'opId', 'deviceId', 'type', 'timestamp', 'applied', 'conflictType', 'json']]);
-    sheet.getRange(1, 1, 1, 8).setFontWeight('bold');
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  if (headers && sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
   }
   return sheet;
 }
 
-/**
- * Returns all existing server opIds from the Ops sheet for dedup.
- */
-function getExistingServerOpIds() {
-  var opsSheet = ensureOpsSheet();
-  var lastRow = Math.max(opsSheet.getLastRow(), 1);
-  if (lastRow < 2) return [];
-  var col = opsSheet.getRange(2, 2, lastRow - 1, 1).getValues();
-  return col.map(function(r) { return String(r[0] || ''); }).filter(Boolean);
+function parseRequest(e) {
+  e = e || {};
+  var p = e.parameter || {};
+  var body = {};
+  if (e.postData && e.postData.contents) {
+    if (e.postData.contents.length > CONFIG.maxRequestChars) throw new Error('PAYLOAD_TOO_LARGE');
+    try { body = JSON.parse(e.postData.contents); } catch (ignore) {}
+  }
+  var payloadRaw = body.payload !== undefined ? body.payload : p.payload;
+  var payload = {};
+  if (payloadRaw && typeof payloadRaw === 'object') payload = payloadRaw;
+  else if (payloadRaw) {
+    try { payload = JSON.parse(payloadRaw); } catch (ex) { throw new Error('INVALID_REQUEST'); }
+  }
+  return {
+    token: String(body.token || p.token || ''),
+    action: String(body.action || p.action || ''),
+    protocolVersion: Number(body.protocolVersion || p.protocolVersion || 0),
+    payload: payload,
+    data: String(body.data || p.data || ''),
+    fileName: String(body.fileName || p.fileName || '')
+  };
 }
 
-/**
- * Returns dedup keys (opId|entityType|entityId|baseRevision) from Ops sheet.
- */
-function getExistingServerOpDetails() {
-  var opsSheet = ensureOpsSheet();
-  var lastRow = Math.max(opsSheet.getLastRow(), 1);
-  if (lastRow < 2) return [];
-  var data = opsSheet.getRange(2, 1, lastRow - 1, 8).getValues();
-  return data.map(function(r) {
-    var op = {};
-    try { op = JSON.parse(r[7] || '{}'); } catch (ex) {}
-    return (r[1] || '') + '|' + (r[3] || '') + '|' + (op.entityId || '') + '|' + (op.baseRevision || 0);
-  }).filter(Boolean);
+function handleRequest(e) {
+  try {
+    var req = parseRequest(e);
+    var authError = validatePassword(req.token);
+    if (authError) return jsonResponse(authError);
+
+    if (req.action === 'IMAGE_UPLOAD') return jsonResponse(handleImageUpload(req));
+    if (req.action === 'SEND_REMINDERS') return jsonResponse(handleSendReminders(req));
+
+    if (req.protocolVersion !== CONFIG.protocolVersion) {
+      return jsonResponse(fail('PROTOCOL_VERSION_MISMATCH', 'Client and server sync protocols differ.', false, {
+        expectedProtocolVersion: CONFIG.protocolVersion,
+        receivedProtocolVersion: req.protocolVersion
+      }));
+    }
+
+    if (req.action === 'SYNC_PULL') return jsonResponse(handleSyncPull(req.payload));
+    if (req.action === 'SYNC_PUSH') return jsonResponse(handleSyncPush(req.payload));
+    if (req.action === 'SYNC_BOOTSTRAP') return jsonResponse(handleSyncBootstrap(req.payload));
+
+    return jsonResponse(fail('INVALID_REQUEST', 'Unknown action: ' + req.action, false));
+  } catch (err) {
+    var code = String(err && err.message || err || 'INTERNAL_ERROR');
+    var known = ['PAYLOAD_TOO_LARGE', 'INVALID_REQUEST', 'SNAPSHOT_CORRUPT', 'CHECKSUM_MISMATCH'];
+    return jsonResponse(fail(known.indexOf(code) >= 0 ? code : 'INTERNAL_ERROR', code, false));
+  }
 }
 
-/**
- * Returns all Ops from the Ops sheet.
- */
-function getAllServerOps() {
-  var opsSheet = ensureOpsSheet();
-  var lastRow = Math.max(opsSheet.getLastRow(), 1);
-  if (lastRow < 2) return [];
-  var data = opsSheet.getRange(2, 1, lastRow - 1, 8).getValues();
-  return data.map(function(r) {
-    var op = {};
-    try { op = JSON.parse(r[7] || '{}'); } catch (ex) {}
-    return {
-      serverSeq: parseInt(r[0] || 0),
-      opId: String(r[1] || ''),
-      deviceId: String(r[2] || ''),
-      type: String(r[3] || ''),
-      timestamp: String(r[4] || ''),
-      applied: String(r[5] || ''),
-      conflictType: String(r[6] || ''),
-      payload: op.payload || {}
-    };
+function ensureMetaSheet() {
+  return ensureSheet('Meta', ['key', 'value']);
+}
+
+function readMeta() {
+  var sheet = ensureMetaSheet();
+  var rows = sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues() : [];
+  var meta = {};
+  rows.forEach(function(r) { if (r[0]) meta[String(r[0])] = String(r[1]); });
+  return {
+    protocolVersion: Number(meta.protocolVersion || CONFIG.protocolVersion),
+    schemaVersion: meta.schemaVersion || CONFIG.schemaVersion,
+    initialized: meta.initialized === 'true',
+    activeSlot: meta.activeSlot || 'A',
+    serverSeq: Number(meta.serverSeq || 0),
+    updatedAt: meta.updatedAt || '',
+    activeChecksum: meta.activeChecksum || '',
+    activeChunkCount: Number(meta.activeChunkCount || 0)
+  };
+}
+
+function writeMeta(meta) {
+  var sheet = ensureMetaSheet();
+  var rows = [
+    ['protocolVersion', String(CONFIG.protocolVersion)],
+    ['schemaVersion', CONFIG.schemaVersion],
+    ['initialized', meta.initialized ? 'true' : 'false'],
+    ['activeSlot', meta.activeSlot || 'A'],
+    ['serverSeq', String(meta.serverSeq || 0)],
+    ['updatedAt', meta.updatedAt || ''],
+    ['activeChecksum', meta.activeChecksum || ''],
+    ['activeChunkCount', String(meta.activeChunkCount || 0)]
+  ];
+  if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).clearContent();
+  sheet.getRange(2, 1, rows.length, 2).setValues(rows);
+}
+
+function checksum(text) {
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
+  return digest.map(function(b) { var n = b < 0 ? b + 256 : b; return ('0' + n.toString(16)).slice(-2); }).join('');
+}
+
+function normalizeSnapshot(input, serverSeq) {
+  var state = input && typeof input === 'object' ? JSON.parse(JSON.stringify(input)) : {};
+  state.protocolVersion = CONFIG.protocolVersion;
+  state.schemaVersion = CONFIG.schemaVersion;
+  state.meta = state.meta || {};
+  state.meta.initialized = true;
+  state.meta.serverSeq = Number(serverSeq || state.meta.serverSeq || 0);
+  state.meta.locationsVersion = Number(state.meta.locationsVersion || state.meta.structureVersion || 0);
+  state.meta.categoriesVersion = Number(state.meta.categoriesVersion || state.meta.categoryVersion || 0);
+  state.meta.householdSettingsVersion = Number(state.meta.householdSettingsVersion || 0);
+  state.segments = state.segments || {};
+  state.coordinates = state.coordinates || {};
+  state.spatialBackgroundImage = state.spatialBackgroundImage || null;
+  state.categories = state.categories || {};
+  state.inventory = Array.isArray(state.inventory) ? state.inventory : [];
+  state.users = Array.isArray(state.users) && state.users.length ? state.users : ['Default'];
+  if (state.users.indexOf('Default') < 0) state.users.unshift('Default');
+  state.userEmails = state.userEmails || {};
+  state.reminderDays = Math.max(1, Math.min(365, Number(state.reminderDays || 30)));
+  delete state.syncQueue;
+  delete state.syncConflicts;
+  delete state.currentUser;
+  delete state.language;
+  delete state.reminderLog;
+
+  var now = new Date().toISOString();
+  state.inventory.forEach(function(item) {
+    item.version = Math.max(1, Number(item.version || 1));
+    item.createdAt = item.createdAt || item.timestamp || now;
+    item.updatedAt = item.updatedAt || item.createdAt;
+    item.deletedAt = item.deletedAt || null;
+    item.stockEntries = Array.isArray(item.stockEntries) ? item.stockEntries : [];
+    item.stockEntries.forEach(function(entry) {
+      entry.version = Math.max(1, Number(entry.version || 1));
+      entry.quantity = Math.max(0, Number(entry.quantity || 0));
+      entry.createdAt = entry.createdAt || entry.updatedAt || item.createdAt;
+      entry.updatedAt = entry.updatedAt || entry.createdAt;
+      entry.hiddenAt = entry.hiddenAt || null;
+    });
+    item.quantity = recomputeItemQuantity(item);
+  });
+  return state;
+}
+
+function readSlot(slot, chunkCount, expectedChecksum) {
+  if (!chunkCount) return null;
+  var sheet = ensureSheet('Data_' + slot);
+  var values = sheet.getRange(1, 1, chunkCount, 1).getValues();
+  var text = values.map(function(r) { return String(r[0] || ''); }).join('');
+  if (expectedChecksum && checksum(text) !== expectedChecksum) throw new Error('CHECKSUM_MISMATCH');
+  try { return JSON.parse(text); } catch (ex) { throw new Error('SNAPSHOT_CORRUPT'); }
+}
+
+function loadCanonical(meta) {
+  if (!meta.initialized) return null;
+  return normalizeSnapshot(readSlot(meta.activeSlot, meta.activeChunkCount, meta.activeChecksum), meta.serverSeq);
+}
+
+function writeCanonicalAtomically(state, meta) {
+  var inactive = meta.activeSlot === 'A' ? 'B' : 'A';
+  state = normalizeSnapshot(state, meta.serverSeq);
+  state.meta.updatedAt = new Date().toISOString();
+  var text = JSON.stringify(state);
+  var count = Math.max(1, Math.ceil(text.length / CONFIG.maxCellSize));
+  var sheet = ensureSheet('Data_' + inactive);
+  sheet.clearContents();
+  var rows = [];
+  for (var i = 0; i < count; i++) rows.push([text.substring(i * CONFIG.maxCellSize, (i + 1) * CONFIG.maxCellSize)]);
+  sheet.getRange(1, 1, rows.length, 1).setValues(rows);
+  SpreadsheetApp.flush();
+  var verify = sheet.getRange(1, 1, count, 1).getValues().map(function(r) { return String(r[0] || ''); }).join('');
+  var sum = checksum(text);
+  if (verify !== text || checksum(verify) !== sum) throw new Error('CHECKSUM_MISMATCH');
+  meta.activeSlot = inactive;
+  meta.activeChecksum = sum;
+  meta.activeChunkCount = count;
+  meta.updatedAt = state.meta.updatedAt;
+  meta.initialized = true;
+  writeMeta(meta);
+  SpreadsheetApp.flush();
+  return state;
+}
+
+function handleSyncPull(payload) {
+  var meta = readMeta();
+  if (!meta.initialized) return { success: true, initialized: false, serverSeq: 0, snapshot: null };
+  return { success: true, initialized: true, serverSeq: meta.serverSeq, snapshot: loadCanonical(meta) };
+}
+
+function withSyncLock(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return fail('SERVER_BUSY', 'Synchronization is temporarily busy.', true);
+  try { return fn(); }
+  finally { lock.releaseLock(); }
+}
+
+function handleSyncBootstrap(payload) {
+  return withSyncLock(function() {
+    var meta = readMeta();
+    if (meta.initialized || Number(payload.expectedServerSeq || 0) !== 0) {
+      return fail('SERVER_ALREADY_INITIALIZED', 'Cloud data has already been initialized.', false);
+    }
+    var state = normalizeSnapshot(payload.snapshot || {}, 0);
+    meta.serverSeq = 0;
+    state = writeCanonicalAtomically(state, meta);
+    writeAudit(payload.deviceId || '', 'SYNC_BOOTSTRAP', 0, true, '');
+    return { success: true, initialized: true, serverSeq: 0, snapshot: state };
   });
 }
 
-/**
- * Appends an operation to the Ops sheet.
- */
-function appendServerOp(op, seq, applied, conflictType) {
-  var opsSheet = ensureOpsSheet();
-  var lastRow = Math.max(opsSheet.getLastRow(), 1);
-  var row = lastRow + 1;
-  opsSheet.getRange(row, 1, 1, 8).setValues([[
-    seq,
-    op.opId || '',
-    op.deviceId || '',
-    op.type || op.entityType || '',
-    op.timestamp || new Date().toISOString(),
-    applied || 'applied',
-    conflictType || '',
-    JSON.stringify({ payload: op.payload || {}, entityId: op.entityId || '', baseRevision: op.baseRevision || 0 })
-  ]]);
+function ensureOpsSheet() {
+  return ensureSheet('Ops', ['serverSeq', 'opId', 'operationHash', 'deviceId', 'type', 'entityType', 'entityId', 'status', 'errorCode', 'entityVersion', 'timestamp', 'json']);
 }
 
-/**
- * Writes a sync session audit row to the SyncAudit sheet.
- */
-function writeSyncAudit(sessionStart, deviceId, baseRevision, newRevision, opsCount, success, durationMs) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('SyncAudit');
-  if (!sheet) {
-    sheet = ss.insertSheet('SyncAudit');
-    sheet.getRange(1, 1, 1, 7).setValues([['Timestamp', 'DeviceId', 'BaseRevision', 'NewRevision', 'OpsCount', 'Success', 'DurationMs']]);
-    sheet.getRange(1, 1, 1, 7).setFontWeight('bold');
-  }
-  var lastRow = Math.max(sheet.getLastRow(), 1);
-  sheet.getRange(lastRow + 1, 1, 1, 7).setValues([[
-    sessionStart.toISOString(),
-    deviceId,
-    baseRevision,
-    newRevision,
-    opsCount,
-    success ? 'true' : 'false',
-    durationMs || 0
-  ]]);
+function loadOperationIndex() {
+  var sheet = ensureOpsSheet();
+  var out = {};
+  if (sheet.getLastRow() < 2) return out;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, 12).getValues().forEach(function(r) {
+    var extra = {};
+    try { extra = JSON.parse(r[11] || '{}'); } catch (ignore) {}
+    out[String(r[1])] = {
+      serverSeq: Number(r[0] || 0), opId: String(r[1] || ''), operationHash: String(r[2] || ''),
+      deviceId: String(r[3] || ''), type: String(r[4] || ''), entityType: String(r[5] || ''),
+      entityId: String(r[6] || ''), status: String(r[7] || ''), errorCode: String(r[8] || ''),
+      entityVersion: Number(r[9] || 0), timestamp: String(r[10] || ''),
+      expectedVersion: extra.expectedVersion, actualVersion: extra.actualVersion, serverEntity: extra.serverEntity
+    };
+  });
+  return out;
 }
 
-/**
- * Writes a dead-lettered operation to the DeadLetters sheet.
- */
-function writeDeadLetter(op, reason) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('DeadLetters');
-  if (!sheet) {
-    sheet = ss.insertSheet('DeadLetters');
-    sheet.getRange(1, 1, 1, 6).setValues([['Timestamp', 'OpId', 'DeviceId', 'Type', 'RawJson', 'ErrorReason']]);
-    sheet.getRange(1, 1, 1, 6).setFontWeight('bold');
-  }
-  var lastRow = Math.max(sheet.getLastRow(), 1);
-  sheet.getRange(lastRow + 1, 1, 1, 6).setValues([[
-    new Date().toISOString(),
-    (op && op.opId) || '',
-    (op && op.deviceId) || '',
-    (op && op.type) || (op && op.entityType) || '',
-    JSON.stringify(op || {}),
-    reason || ''
-  ]]);
+function opHash(op) {
+  var stable = {
+    opId: op.opId, type: op.type, entityType: op.entityType, entityId: op.entityId,
+    baseVersion: Number(op.baseVersion || 0), dependsOnOpId: op.dependsOnOpId || null,
+    deviceId: op.deviceId || '', payload: op.payload || {}
+  };
+  return checksum(JSON.stringify(stable));
 }
 
-function getStockOpDelta(type, amount) {
-  var n = Number(amount || 0);
-  if (!isFinite(n)) return 0;
-  var abs = Math.abs(n);
-  return type === 'STOCK_OUT' ? -abs : abs;
+function appendOperation(op, hash, result) {
+  var sheet = ensureOpsSheet();
+  sheet.appendRow([
+    result.serverSeq || '', op.opId || '', hash, op.deviceId || '', op.type || '', op.entityType || '',
+    op.entityId || '', result.status || '', result.errorCode || '', result.entityVersion || '',
+    new Date().toISOString(), JSON.stringify({
+      expectedVersion: result.expectedVersion, actualVersion: result.actualVersion, serverEntity: result.serverEntity || null
+    })
+  ]);
 }
 
-function recomputeItemStockQuantity(item) {
-  if (!item || !item.stockEntries || !Array.isArray(item.stockEntries)) return 0;
-  return item.stockEntries.reduce(function(sum, entry) {
-    if (entry && !entry.hiddenAt) {
-      sum += Number(entry.quantity || 0);
-    }
-    return sum;
+function resultFor(op, status, extra) {
+  var out = { opId: op.opId || '', status: status, entityType: op.entityType || '', entityId: op.entityId || '' };
+  Object.keys(extra || {}).forEach(function(k) { out[k] = extra[k]; });
+  return out;
+}
+
+function validateOperation(op) {
+  if (!op || !op.opId || !op.type || !op.entityType || !op.entityId) return 'INVALID_OPERATION';
+  var allowed = ['ITEM_PUT', 'ITEM_DELETE', 'STOCK_ENTRY_PUT', 'STOCK_ENTRY_DELETE', 'STOCK_ADJUST', 'LOCATIONS_PUT', 'CATEGORIES_PUT', 'HOUSEHOLD_SETTINGS_PUT'];
+  if (allowed.indexOf(op.type) < 0) return 'UNKNOWN_OPERATION';
+  return '';
+}
+
+function findItem(state, id) {
+  return (state.inventory || []).find(function(item) { return item.id === id; }) || null;
+}
+
+function findEntry(item, id) {
+  return ((item && item.stockEntries) || []).find(function(entry) { return entry.id === id; }) || null;
+}
+
+function recomputeItemQuantity(item) {
+  return ((item && item.stockEntries) || []).reduce(function(sum, entry) {
+    return entry && !entry.hiddenAt ? sum + Number(entry.quantity || 0) : sum;
   }, 0);
 }
 
-/**
- * Applies a single operation to the server state.
- * Implements domain-specific merge rules:
- *  - segments/categories/coordinates: operation replay
- *  - inventory items: field-level merge by updatedAt
- *  - stockEntries: merge by id
- *  - soft deletes: tombstoning
- */
-function applyServerOperationstate(state, op) {
-  if (!state || !op) return {};
-  var payload = op.payload || {};
-  var type = op.type || op.entityType || '';
-
-  switch (type) {
-    case 'ADD_SEGMENT':
-      if (payload.segment && payload.name) {
-        state.segments = state.segments || {};
-        state.segments[payload.name || payload.segment] = state.segments[payload.name || payload.segment] || {};
-      }
-      break;
-    case 'DELETE_SEGMENT':
-      if (payload.name) delete (state.segments || {})[payload.name];
-      break;
-    case 'ADD_CONTAINER':
-      if (payload.segment && payload.container) {
-        state.segments = state.segments || {};
-        state.segments[payload.segment] = state.segments[payload.segment] || {};
-        state.segments[payload.segment][payload.container] = state.segments[payload.segment][payload.container] || [];
-      }
-      break;
-    case 'ADD_SUB_CONTAINER':
-      if (payload.segment && payload.container && payload.subContainer) {
-        state.segments = state.segments || {};
-        state.segments[payload.segment] = state.segments[payload.segment] || {};
-        state.segments[payload.segment][payload.container] = state.segments[payload.segment][payload.container] || [];
-        if (state.segments[payload.segment][payload.container].indexOf(payload.subContainer) === -1) {
-          state.segments[payload.segment][payload.container].push(payload.subContainer);
-        }
-      }
-      break;
-    case 'UPDATE_INVENTORY':
-    case 'ADD_INVENTORY':
-      if (payload.itemId || (payload.item && payload.item.id)) {
-        state.inventory = state.inventory || [];
-        var itemId = payload.itemId || payload.item.id;
-        var remoteItem = payload.item || { id: itemId };
-        var idx = state.inventory.reduce(function(acc, it, i) { return it.id === itemId ? i : acc; }, -1);
-        if (idx >= 0) {
-          // Field-level merge: remote only overwrites if newer
-          var local = state.inventory[idx];
-          var rTime = remoteItem.updatedAt ? new Date(remoteItem.updatedAt).getTime() : 0;
-          var lTime = local.updatedAt ? new Date(local.updatedAt).getTime() : 0;
-          if (rTime >= lTime) {
-            state.inventory[idx] = mergeInventoryFields(local, remoteItem);
-          }
-          // Conflict if both modified different fields
-          if (rTime > 0 && lTime > 0 && Math.abs(rTime - lTime) < 1000 && op.deviceId !== local.lastModifiedBy) {
-            return { conflictType: 'simultaneous_edit', message: 'Both devices edited item simultaneously' };
-          }
-        } else {
-          state.inventory.push(remoteItem);
-        }
-      }
-      break;
-    case 'DELETE_INVENTORY':
-      if (payload.itemId) {
-        state.inventory = state.inventory || [];
-        var ditem = state.inventory.find(function(i) { return i.id === payload.itemId; });
-        if (ditem) ditem.deletedAt = payload.deletedAt || new Date().toISOString();
-      }
-      break;
-    case 'STOCK_IN':
-    case 'STOCK_OUT':
-      if (payload.itemId && payload.entryId) {
-        var sitem = (state.inventory || []).find(function(i) { return i.id === payload.itemId; });
-        if (sitem && sitem.stockEntries) {
-          var sentry = sitem.stockEntries.find(function(e) { return e.id === payload.entryId; });
-          if (sentry) {
-            var delta = getStockOpDelta(type, payload.amount);
-            sentry.quantity = Math.max(0, Number(sentry.quantity || 0) + delta);
-            sentry.updatedAt = payload.timestamp || new Date().toISOString();
-          }
-          sitem.quantity = recomputeItemStockQuantity(sitem);
-          sitem.updatedAt = payload.timestamp || new Date().toISOString();
-        }
-      }
-      break;
-    case 'ADD_USER':
-    case 'SWITCH_USER':
-    case 'SAVE_LAYOUT':
-    case 'SAVE_CLASSIFICATION':
-    case 'SET_REMINDER':
-      // No conflict — apply trivially via payload replay
-      break;
-    default:
-      break;
-  }
-  return {};
-}
-
-function mergeInventoryFields(local, remote) {
-  var fields = ['name', 'brand', 'category', 'segment', 'container', 'subContainer',
-    'owner', 'remarks', 'aiMetadata', 'barcodeId', 'uom', 'minQuantity',
-    'purchaseDate', 'warrantyDate', 'expiryDate', 'itemType',
-    'updatedAt', 'version', 'lastModifiedBy', 'imageUrl', 'imageThumbUrl',
-    'imageSourceType', 'imageThumbKey', 'imageFullKey', 'imageMeta'];
-  fields.forEach(function(f) {
-    if (remote[f] !== undefined && remote[f] !== '') local[f] = remote[f];
+function conflict(op, actualVersion, serverEntity, code) {
+  return resultFor(op, 'conflict', {
+    errorCode: code || 'VERSION_CONFLICT', expectedVersion: Number(op.baseVersion || 0),
+    actualVersion: Number(actualVersion || 0), serverEntity: JSON.parse(JSON.stringify(serverEntity || null))
   });
-  // Merge stockEntries by id
-  if (remote.stockEntries && Array.isArray(remote.stockEntries)) {
-    if (!local.stockEntries) local.stockEntries = [];
-    var localMap = {};
-    local.stockEntries.forEach(function(e) { localMap[e.id] = e; });
-    remote.stockEntries.forEach(function(re) {
-      if (!localMap[re.id]) local.stockEntries.push(re);
-      else {
-        var le = localMap[re.id];
-        var reTime = re.updatedAt ? new Date(re.updatedAt).getTime() : 0;
-        var leTime = le.updatedAt ? new Date(le.updatedAt).getTime() : 0;
-        if (reTime >= leTime) local.stockEntries = local.stockEntries.map(function(e) { return e.id === re.id ? re : e; });
-      }
-    });
-  }
-  return local;
 }
 
-// ─── Action Handlers ────────────────────────────────────────────────────────
+function applyOperation(state, meta, op) {
+  var p = op.payload || {};
+  var now = new Date().toISOString();
+  var item, entry, incoming, version;
 
-/**
- * SYNC_PULL — returns the full application state JSON stored in the Data sheet.
- */
-function handleSyncPull(sheet, params) {
-  var startTs = new Date();
-  var chunkCount = parseInt(sheet.getRange('B2').getValue(), 10) || 1;
-  var fullData = '';
-  for (var i = 0; i < chunkCount; i++) {
-    fullData += (sheet.getRange('A' + (i + 1)).getValue() || '');
+  if (op.type === 'ITEM_PUT') {
+    item = findItem(state, op.entityId);
+    if (!item) {
+      if (Number(op.baseVersion || 0) !== 0) return conflict(op, 0, null, 'ENTITY_NOT_FOUND');
+      incoming = p.item || {};
+      if (!incoming.id || incoming.id !== op.entityId) return resultFor(op, 'rejected', { errorCode: 'INVALID_OPERATION' });
+      incoming = JSON.parse(JSON.stringify(incoming));
+      delete incoming.stockEntries; delete incoming.quantity; delete incoming.deletedAt;
+      incoming.version = 1; incoming.createdAt = now; incoming.updatedAt = now; incoming.deletedAt = null; incoming.stockEntries = [];
+      state.inventory.push(incoming);
+      return resultFor(op, 'applied', { entityVersion: 1 });
+    }
+    if (item.deletedAt) return conflict(op, item.version, item, 'ENTITY_DELETED');
+    if (Number(op.baseVersion || 0) !== Number(item.version || 0)) return conflict(op, item.version, item);
+    incoming = JSON.parse(JSON.stringify(p.item || {}));
+    delete incoming.stockEntries; delete incoming.quantity; delete incoming.version; delete incoming.createdAt; delete incoming.updatedAt; delete incoming.deletedAt;
+    Object.keys(incoming).forEach(function(k) { if (k !== 'id') item[k] = incoming[k]; });
+    item.version = Number(item.version || 0) + 1; item.updatedAt = now; item.quantity = recomputeItemQuantity(item);
+    return resultFor(op, 'applied', { entityVersion: item.version });
   }
-  var currentRev = parseInt(sheet.getRange('B3').getValue()) || 0;
-  var respData = fullData ? JSON.parse(fullData) : {};
-  respData.meta = respData.meta || {};
-  respData.meta.lastServerRevision = currentRev;
-  respData.meta.checksum = '';
-  respData.meta.schemaVersion = CONFIG.schemaVersion;
-  if (!respData.segments) respData.segments = {};
-  if (!respData.inventory) respData.inventory = [];
-  if (!respData.coordinates) respData.coordinates = {};
-  if (!respData.categories) respData.categories = {};
 
-  var endTs = new Date();
-  writeSyncAudit(startTs, params.token ? 'pull_' + params.token.toString().substr(0, 8) : 'pull', currentRev, currentRev, 0, true, endTs - startTs);
+  if (op.type === 'ITEM_DELETE') {
+    item = findItem(state, op.entityId);
+    if (!item) return conflict(op, 0, null, 'ENTITY_NOT_FOUND');
+    if (Number(op.baseVersion || 0) !== Number(item.version || 0)) return conflict(op, item.version, item);
+    item.deletedAt = now; item.updatedAt = now; item.version = Number(item.version || 0) + 1;
+    return resultFor(op, 'applied', { entityVersion: item.version });
+  }
 
-  return jsonResponse(respData, params.jsonp);
+  if (op.type === 'STOCK_ENTRY_PUT') {
+    item = findItem(state, p.itemId);
+    if (!item || item.deletedAt) return resultFor(op, 'rejected', { errorCode: item ? 'ENTITY_DELETED' : 'ENTITY_NOT_FOUND' });
+    entry = findEntry(item, op.entityId);
+    if (!entry) {
+      if (Number(op.baseVersion || 0) !== 0) return conflict(op, 0, null, 'ENTITY_NOT_FOUND');
+      incoming = JSON.parse(JSON.stringify(p.entry || {}));
+      incoming.id = op.entityId; incoming.quantity = Math.max(0, Number(p.initialQuantity || 0));
+      incoming.version = 1; incoming.createdAt = now; incoming.updatedAt = now; incoming.hiddenAt = null;
+      item.stockEntries = item.stockEntries || []; item.stockEntries.push(incoming);
+      item.version = Number(item.version || 0) + 1; item.updatedAt = now; item.quantity = recomputeItemQuantity(item);
+      return resultFor(op, 'applied', { entityVersion: 1 });
+    }
+    if (entry.hiddenAt) return conflict(op, entry.version, entry, 'ENTITY_DELETED');
+    if (Number(op.baseVersion || 0) !== Number(entry.version || 0)) return conflict(op, entry.version, entry);
+    incoming = JSON.parse(JSON.stringify(p.entry || {}));
+    delete incoming.quantity; delete incoming.version; delete incoming.createdAt; delete incoming.updatedAt; delete incoming.hiddenAt;
+    Object.keys(incoming).forEach(function(k) { if (k !== 'id') entry[k] = incoming[k]; });
+    entry.version = Number(entry.version || 0) + 1; entry.updatedAt = now;
+    item.version = Number(item.version || 0) + 1; item.updatedAt = now; item.quantity = recomputeItemQuantity(item);
+    return resultFor(op, 'applied', { entityVersion: entry.version });
+  }
+
+  if (op.type === 'STOCK_ENTRY_DELETE') {
+    item = findItem(state, p.itemId); entry = findEntry(item, p.entryId);
+    if (!entry) return conflict(op, 0, null, 'ENTITY_NOT_FOUND');
+    if (Number(op.baseVersion || 0) !== Number(entry.version || 0)) return conflict(op, entry.version, entry);
+    entry.hiddenAt = now; entry.updatedAt = now; entry.version = Number(entry.version || 0) + 1;
+    item.version = Number(item.version || 0) + 1; item.updatedAt = now; item.quantity = recomputeItemQuantity(item);
+    return resultFor(op, 'applied', { entityVersion: entry.version });
+  }
+
+  if (op.type === 'STOCK_ADJUST') {
+    item = findItem(state, p.itemId); entry = findEntry(item, p.entryId);
+    if (!item || item.deletedAt || !entry || entry.hiddenAt) return resultFor(op, 'rejected', { errorCode: 'ENTITY_NOT_FOUND' });
+    var delta = Number(p.delta);
+    if (!isFinite(delta) || delta === 0) return resultFor(op, 'rejected', { errorCode: 'INVALID_OPERATION' });
+    var next = Number(entry.quantity || 0) + delta;
+    if (next < 0) return resultFor(op, 'rejected', { errorCode: 'INSUFFICIENT_STOCK' });
+    entry.quantity = next; entry.version = Number(entry.version || 0) + 1; entry.updatedAt = now;
+    item.version = Number(item.version || 0) + 1; item.updatedAt = now; item.quantity = recomputeItemQuantity(item);
+    return resultFor(op, 'applied', { entityVersion: entry.version });
+  }
+
+  if (op.type === 'LOCATIONS_PUT') {
+    version = Number(state.meta.locationsVersion || 0);
+    if (Number(op.baseVersion || 0) !== version) return conflict(op, version, { segments: state.segments, coordinates: state.coordinates, spatialBackgroundImage: state.spatialBackgroundImage });
+    state.segments = JSON.parse(JSON.stringify(p.segments || {})); state.coordinates = JSON.parse(JSON.stringify(p.coordinates || {})); state.spatialBackgroundImage = p.spatialBackgroundImage || null;
+    state.meta.locationsVersion = version + 1; return resultFor(op, 'applied', { entityVersion: state.meta.locationsVersion });
+  }
+
+  if (op.type === 'CATEGORIES_PUT') {
+    version = Number(state.meta.categoriesVersion || 0);
+    if (Number(op.baseVersion || 0) !== version) return conflict(op, version, { categories: state.categories });
+    state.categories = JSON.parse(JSON.stringify(p.categories || {})); state.meta.categoriesVersion = version + 1;
+    return resultFor(op, 'applied', { entityVersion: state.meta.categoriesVersion });
+  }
+
+  if (op.type === 'HOUSEHOLD_SETTINGS_PUT') {
+    version = Number(state.meta.householdSettingsVersion || 0);
+    if (Number(op.baseVersion || 0) !== version) return conflict(op, version, { users: state.users, userEmails: state.userEmails, reminderDays: state.reminderDays });
+    var users = Array.isArray(p.users) ? p.users.filter(function(v, i, a) { return v && a.indexOf(v) === i; }) : ['Default'];
+    if (users.indexOf('Default') < 0) users.unshift('Default');
+    state.users = users; state.userEmails = p.userEmails || {}; state.reminderDays = Math.max(1, Math.min(365, Number(p.reminderDays || 30)));
+    state.meta.householdSettingsVersion = version + 1;
+    return resultFor(op, 'applied', { entityVersion: state.meta.householdSettingsVersion });
+  }
+
+  return resultFor(op, 'rejected', { errorCode: 'UNKNOWN_OPERATION' });
 }
 
-/**
- * SYNC_PUSH — processes an array of operations against the server state.
- * Dedupes by opId + entityType + entityId + baseRevision combination.
- * Appends audit rows to SyncAudit sheet. Dead-letter invalid ops.
- * Returns ackedOpIds, remoteOps since lastPulledServerSeq, and conflicts[].
- */
-function handleSyncPush(sheet, params) {
-  var startTs = new Date();
-  var operations = params.operations || [];
-  var currentRev = parseInt(sheet.getRange('B3').getValue()) || 0;
-  var deviceId = params.deviceId || 'unknown';
-  var success = true;
-  var opsCount = operations.length;
+function handleSyncPush(payload) {
+  return withSyncLock(function() {
+    var operations = Array.isArray(payload.operations) ? payload.operations : [];
+    if (operations.length > CONFIG.maxOperations) return fail('PAYLOAD_TOO_LARGE', 'Too many operations in one push.', false);
+    var meta = readMeta();
+    if (!meta.initialized) return fail('SERVER_NOT_INITIALIZED', 'Cloud storage must be initialized first.', false);
+    var state = loadCanonical(meta);
+    var index = loadOperationIndex();
+    var batchResults = {};
+    var results = [];
 
-  // ── Load current server state ─────────────────────────────────────────────
-  var chunkCount = parseInt(sheet.getRange('B2').getValue()) || 1;
-  var fullData = '';
-  for (var i = 0; i < chunkCount; i++) {
-    fullData += (sheet.getRange('A' + (i + 1)).getValue() || '');
-  }
-  var state = {};
-  try { state = fullData ? JSON.parse(fullData) : {}; } catch (ex) {}
-
-  // ── Idempotency check: opId + entityType + entityId + baseRevision ────────
-  var existingOps = getExistingServerOpIds();
-  var existingOpDetail = getExistingServerOpDetails();
-  var appliedOpIds = [];
-  var conflictResults = [];
-  var seq = currentRev;
-
-  for (var o = 0; o < operations.length; o++) {
-    var op = operations[o] || {};
-    var dedupKey = (op.opId || '') + '|' + (op.type || op.entityType || '') + '|' + (op.entityId || '') + '|' + (op.baseRevision || 0);
-
-    if (existingOpDetail.indexOf(dedupKey) !== -1) {
-      appliedOpIds.push(op.opId || '');
-      continue;
-    }
-
-    // Validate schema
-    if (!op.opId || !op.type && !op.entityType) {
-      writeDeadLetter(op, 'Missing opId or type');
-      continue;
-    }
-
-    try {
-      var applyResult = applyServerOperationstate(state, op);
-      if (applyResult && applyResult.conflictType) {
-        conflictResults.push({
-          opId: op.opId,
-          serverSeq: currentRev + 1,
-          type: op.type || op.entityType || '',
-          deviceId: op.deviceId || '',
-          conflictType: applyResult.conflictType,
-          message: applyResult.message || '',
-          payload: op.payload || {},
-          timestamp: new Date().toISOString()
-        });
+    operations.forEach(function(op) {
+      var validation = validateOperation(op);
+      var hash = opHash(op || {});
+      var existing = op && index[op.opId];
+      var result;
+      if (validation) result = resultFor(op || {}, 'rejected', { errorCode: validation });
+      else if (existing) {
+        result = existing.operationHash === hash ? resultFor(op, 'duplicate', {
+          serverSeq: existing.serverSeq, entityVersion: existing.entityVersion, errorCode: existing.errorCode || undefined
+        }) : resultFor(op, 'rejected', { errorCode: 'OP_ID_REUSE' });
+      } else if (op.dependsOnOpId && (!batchResults[op.dependsOnOpId] && !index[op.dependsOnOpId] ||
+                 batchResults[op.dependsOnOpId] && ['applied', 'duplicate'].indexOf(batchResults[op.dependsOnOpId].status) < 0 ||
+                 index[op.dependsOnOpId] && ['applied', 'duplicate'].indexOf(index[op.dependsOnOpId].status) < 0)) {
+        result = resultFor(op, 'blocked', { errorCode: 'DEPENDENCY_FAILED' });
       } else {
-        appliedOpIds.push(op.opId || '');
+        result = applyOperation(state, meta, op);
+        if (result.status === 'applied') {
+          meta.serverSeq += 1;
+          result.serverSeq = meta.serverSeq;
+          state.meta.serverSeq = meta.serverSeq;
+        }
       }
-      // Write to Ops sheet
-      seq += 1;
-      appendServerOp(op, seq, applyResult && applyResult.conflictType ? 'conflict' : 'applied', applyResult ? applyResult.conflictType || '' : '');
-    } catch (ex) {
-      writeDeadLetter(op, 'Apply error: ' + ex.toString());
-    }
-  }
+      results.push(result); batchResults[op && op.opId || ''] = result;
+      if (!existing && op && op.opId) { appendOperation(op, hash, result); index[op.opId] = Object.assign({ operationHash: hash }, result); }
+      if (result.status === 'rejected') writeDeadLetter(op, result.errorCode || 'INVALID_OPERATION');
+    });
 
-  // ── Write updated state back ──────────────────────────────────────────────
-  var payloadStr = JSON.stringify(state);
-  var totalChunks = Math.ceil(payloadStr.length / CONFIG.maxCellSize);
-  sheet.getRange('A:A').clearContent();
-  for (var j = 0; j < totalChunks; j++) {
-    sheet.getRange('A' + (j + 1)).setValue(
-      payloadStr.substring(j * CONFIG.maxCellSize, (j + 1) * CONFIG.maxCellSize)
-    );
-  }
-  var ts = new Date().toISOString();
-  var newRev = seq;
-  sheet.getRange('B1').setValue(ts);
-  sheet.getRange('B2').setValue(totalChunks);
-  sheet.getRange('B3').setValue(newRev);
-  SpreadsheetApp.flush();
-
-  // ── Remote ops since lastPulledServerSeq ──────────────────────────────────
-  var lastSeq = parseInt(params.lastPulledServerSeq || 0);
-  var allOps = getAllServerOps();
-  var remoteOps = allOps.filter(function(op) { return (op.serverSeq || 0) > lastSeq; });
-
-  // ── Sync audit ────────────────────────────────────────────────────────────
-  var endTs = new Date();
-  writeSyncAudit(startTs, deviceId, currentRev, newRev, opsCount, success, endTs - startTs);
-
-  return jsonResponse({
-    success: true,
-    revision: newRev,
-    savedAt: ts,
-    ackedOpIds: appliedOpIds,
-    receivedOpIds: appliedOpIds,
-    remoteOps: remoteOps,
-    conflicts: conflictResults,
-    latestServerSeq: newRev,
-    chunks: totalChunks,
-    schemaVersion: CONFIG.schemaVersion
+    state = writeCanonicalAtomically(state, meta);
+    writeAudit(payload.deviceId || '', 'SYNC_PUSH', operations.length, true, '');
+    return { success: true, serverSeq: meta.serverSeq, results: results, snapshot: state };
   });
 }
 
-// ─── Request Parser ──────────────────────────────────────────────────────────
-
-function parseRequestParams(e) {
-  e = e || {};
-  var p = e.parameter || {};
-  var result = {
-    token:       (p.token || '').trim(),
-    action:      (p.action || '').trim(),
-    payload:     (p.payload || '').trim(),
-    operations:  [],
-    clientRevision: (p.clientRevision || '').trim(),
-    baseRevision:  (p.baseRevision || '').trim(),
-    data:        (p.data || '').trim(),
-    fileName:    (p.fileName || '').trim(),
-    schemaVersion: (p.schemaVersion || '').trim(),
-    jsonp:       (p.jsonp || '').trim()
-  };
-
-  if (p.operations) {
-    try { result.operations = JSON.parse(p.operations); } catch (ex) {}
-  }
-
-  if (!result.token && !result.action && e.postData && e.postData.contents) {
-    var body = e.postData.contents;
-    try {
-      var jsonBody = JSON.parse(body);
-      result.token       = jsonBody.token       || result.token;
-      result.action      = jsonBody.action      || result.action;
-      result.payload     = jsonBody.payload     || result.payload;
-      result.operations  = jsonBody.operations  || result.operations;
-      result.clientRevision = jsonBody.clientRevision || result.clientRevision;
-      result.baseRevision  = jsonBody.baseRevision  || result.baseRevision;
-      result.data        = jsonBody.data        || result.data;
-      result.fileName    = jsonBody.fileName    || result.fileName;
-      result.schemaVersion = jsonBody.schemaVersion || result.schemaVersion;
-      if (result.payload && typeof result.payload === 'object') {
-        result.payload = JSON.stringify(result.payload);
-      }
-    } catch (ex) {
-      var match;
-      match = body.match(/token=([^&]*)/);
-      if (match) result.token = decodeURIComponent(match[1]);
-      match = body.match(/action=([^&]*)/);
-      if (match) result.action = decodeURIComponent(match[1]);
-      match = body.match(/payload=([\s\S]*)/);
-      if (match) {
-        var rawPayload = decodeURIComponent(match[1]);
-        var ampIdx = rawPayload.lastIndexOf('&operations=');
-        if (ampIdx === -1) ampIdx = rawPayload.lastIndexOf('&clientRevision=');
-        if (ampIdx === -1) ampIdx = rawPayload.lastIndexOf('&data=');
-        if (ampIdx !== -1) rawPayload = rawPayload.substring(0, ampIdx);
-        result.payload = rawPayload;
-      }
-      match = body.match(/data=([\s\S]*)/);
-      if (match) {
-        var rawData = decodeURIComponent(match[1]);
-        var dAmpIdx = rawData.lastIndexOf('&fileName=');
-        if (dAmpIdx === -1) dAmpIdx = rawData.lastIndexOf('&schemaVersion=');
-        if (dAmpIdx !== -1) rawData = rawData.substring(0, dAmpIdx);
-        result.data = rawData;
-      }
-      match = body.match(/fileName=([^&]*)/);
-      if (match) result.fileName = decodeURIComponent(match[1]);
-      match = body.match(/schemaVersion=([^&]*)/);
-      if (match) result.schemaVersion = decodeURIComponent(match[1]);
-    }
-  }
-
-  return result;
+function writeDeadLetter(op, reason) {
+  var sheet = ensureSheet('DeadLetters', ['Timestamp', 'OpId', 'DeviceId', 'Type', 'RawJson', 'ErrorReason']);
+  sheet.appendRow([new Date().toISOString(), op && op.opId || '', op && op.deviceId || '', op && op.type || '', JSON.stringify(op || {}), reason || '']);
 }
 
-// ─── Main Request Router ────────────────────────────────────────────────────
-
-function handleRequest(e) {
-  e = e || {};
-
-  try {
-    var params = parseRequestParams(e);
-
-    // 1. Validate password on every request.
-    var auth = validatePassword(params.token);
-    if (!auth.valid) {
-      return jsonResponse({ success: false, error: auth.errorMessage }, params.jsonp);
-    }
-
-    // 2. Route to the appropriate action.
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var action = params.action;
-
-    if (action === 'SYNC_PULL') {
-      var dataSheet = ensureSheet(CONFIG.dataSheet);
-      return handleSyncPull(dataSheet, params);
-    }
-
-    if (action === 'SYNC_PUSH') {
-      var pushSheet = ensureSheet(CONFIG.dataSheet);
-      return handleSyncPush(pushSheet, params);
-    }
-
-    if (action === 'IMAGE_UPLOAD') {
-      return handleImageUpload(params);
-    }
-
-    if (action === 'SEND_REMINDERS') {
-      return handleSendReminders(params);
-    }
-
-    return jsonResponse({
-      success: false,
-      error: 'Unknown action: ' + action,
-      schemaVersion: CONFIG.schemaVersion
-    }, params.jsonp);
-
-  } catch (err) {
-    return jsonResponse({
-      success: false,
-      error: err.toString(),
-      schemaVersion: CONFIG.schemaVersion
-    });
-  }
+function writeAudit(deviceId, action, count, success, errorCode) {
+  var sheet = ensureSheet('SyncAudit', ['Timestamp', 'DeviceId', 'Action', 'OpsCount', 'Success', 'ErrorCode']);
+  sheet.appendRow([new Date().toISOString(), deviceId, action, count, success ? 'true' : 'false', errorCode || '']);
 }
 
-// ─── Image Upload ───────────────────────────────────────────────────────────
-
-/**
- * IMAGE_UPLOAD — stores a base64-encoded image in Google Drive (ItemPhotos folder),
- * makes it publicly viewable, and returns a direct image URL.
- *
- * Expects: params.data (base64 string), params.fileName (optional)
- * Returns: { success: true, url: "...", fileId: "..." }
- */
-function handleImageUpload(params) {
-  var data = (params.data || '').trim();
-  if (!data) {
-    return jsonResponse({ success: false, error: 'Missing image data.' });
-  }
-
-  try {
-    var folder = getOrCreateItemPhotosFolder();
-    var decoded = Utilities.base64Decode(data);
-    var blob = Utilities.newBlob(decoded, 'image/jpeg', params.fileName || 'photo.jpg');
-    var file = folder.createFile(blob);
-    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-
-    var url = 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w1280';
-
-    return jsonResponse({
-      success: true,
-      url: url,
-      fileId: file.getId(),
-      fileName: file.getName(),
-      mimeType: file.getMimeType(),
-      sizeBytes: file.getSize()
-    });
-  } catch (err) {
-    return jsonResponse({ success: false, error: 'Image upload failed: ' + err.toString() });
-  }
+function migrateLegacyDataToV3() {
+  return withSyncLock(function() {
+    var meta = readMeta();
+    if (meta.initialized) throw new Error('SERVER_ALREADY_INITIALIZED');
+    var legacy = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Data');
+    var state = {};
+    if (legacy && legacy.getLastRow() > 0) {
+      var count = Number(legacy.getRange('B2').getValue() || legacy.getLastRow() || 1);
+      var text = legacy.getRange(1, 1, count, 1).getValues().map(function(r) { return String(r[0] || ''); }).join('');
+      if (text) state = JSON.parse(text);
+      var backup = ensureSheet('Legacy_Data_Backup_' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss'));
+      backup.getRange(1, 1, legacy.getDataRange().getNumRows(), legacy.getDataRange().getNumColumns()).setValues(legacy.getDataRange().getValues());
+    }
+    meta.serverSeq = Number(state.meta && state.meta.lastServerRevision || 0);
+    state = writeCanonicalAtomically(normalizeSnapshot(state, meta.serverSeq), meta);
+    Logger.log('Migration complete: ' + state.inventory.length + ' items, serverSeq=' + meta.serverSeq);
+    return state;
+  });
 }
 
-function getOrCreateItemPhotosFolder() {
+function setSyncSecret(secret) {
+  if (!secret || String(secret).length < 16) throw new Error('Secret must contain at least 16 characters.');
+  PropertiesService.getScriptProperties().setProperty(CONFIG.secretProperty, String(secret));
+}
+
+function handleImageUpload(req) {
+  if (!req.data) return fail('INVALID_REQUEST', 'Missing image data.', false);
+  var raw = req.data.replace(/^data:image\/\w+;base64,/, '');
+  var blob = Utilities.newBlob(Utilities.base64Decode(raw), 'image/jpeg', req.fileName || ('item_' + Date.now() + '.jpg'));
   var folders = DriveApp.getFoldersByName('ItemPhotos');
-  if (folders.hasNext()) return folders.next();
-  return DriveApp.createFolder('ItemPhotos');
+  var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder('ItemPhotos');
+  var file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return { success: true, fileId: file.getId(), url: 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w1280' };
 }
 
-// ─── Reminder Engine ─────────────────────────────────────────────────────────
-
-/**
- * Handles client-initiated SEND_REMINDERS requests from the frontend
- * manual "Send Reminder Test" button.
- *
- * Expects params.payload = JSON array of recipient groups (structured by frontend).
- * Each group: { email, owner, items: [...], dedupeKeys: [...] }
- */
-function handleSendReminders(params) {
-  var rawPayload = (params.payload || '').trim();
-  if (!rawPayload) {
-    return jsonResponse({ success: false, error: 'Missing payload.' });
-  }
-
-  var groups;
-  try {
-    groups = JSON.parse(rawPayload);
-  } catch (err) {
-    return jsonResponse({ success: false, error: 'Invalid payload JSON: ' + err.message });
-  }
-
-  if (!Array.isArray(groups) || groups.length === 0) {
-    return jsonResponse({ success: true, sent: 0, recipients: 0 });
-  }
-
-  var tz = Session.getScriptTimeZone();
-  var todayStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-
-  var sentCount = 0;
-  var recipientCount = 0;
-  var errors = [];
-
+function handleSendReminders(req) {
+  var groups = req.payload && req.payload.groups ? req.payload.groups : req.payload;
+  if (!Array.isArray(groups)) return fail('INVALID_REQUEST', 'Reminder payload must be an array.', false);
+  var sent = 0;
   groups.forEach(function(group) {
-    var email = group.email;
-    var nOwner = group.owner || '';
-    var items = group.items || [];
-
-    if (!email || items.length === 0) return;
-
-    try {
-      var htmlBody = buildReminderEmailHtml(nOwner, items, todayStr);
-      MailApp.sendEmail({
-        to: email,
-        subject: 'Inventory Reminder: Expiry / Low Stock Alerts',
-        htmlBody: htmlBody
-      });
-      sentCount++;
-      recipientCount++;
-    } catch (err) {
-      errors.push('Failed for ' + email + ': ' + err.message);
-    }
+    if (!group || !group.email || !Array.isArray(group.items) || !group.items.length) return;
+    var body = '<h2>Home inventory reminder</h2><ul>' + group.items.map(function(item) {
+      return '<li><strong>' + String(item.name || '').replace(/[<>]/g, '') + '</strong></li>';
+    }).join('') + '</ul>';
+    MailApp.sendEmail({ to: group.email, subject: 'Home inventory reminder', htmlBody: body });
+    sent += 1;
   });
-
-  return jsonResponse({
-    success: true,
-    sent: sentCount,
-    recipients: recipientCount,
-    errors: errors.length > 0 ? errors : undefined
-  });
-}
-
-/**
- * Builds an HTML email body from the structured reminder groups.
- */
-function buildReminderEmailHtml(ownerName, items, todayStr) {
-  var expiringItems = [];
-  var lowStockItems = [];
-
-  items.forEach(function(item) {
-    var reminderTypes = item.reminderTypes || [];
-
-    if (reminderTypes.indexOf('expiry') !== -1) {
-      (item.expiryDetails || []).forEach(function(ed) {
-        expiringItems.push({
-          name: item.name || '',
-          itemId: item.itemId || '',
-          category: item.category || '',
-          location: ed.locationLabel || '—',
-          expiryDate: ed.expiryDate || '',
-          daysLeft: ed.daysLeft,
-          remarks: item.remarks || ''
-        });
-      });
-    }
-
-    if (reminderTypes.indexOf('low_stock') !== -1) {
-      lowStockItems.push({
-        name: item.name || '',
-        itemId: item.itemId || '',
-        category: item.category || '',
-        quantity: item.quantity || 0,
-        minQuantity: item.minQuantity || 0,
-        uom: item.uom || 'pcs',
-        remarks: item.remarks || ''
-      });
-    }
-  });
-
-  var totalAlerts = expiringItems.length + lowStockItems.length;
-
-  var html = '<html><body style="font-family:Arial,sans-serif;color:#1e293b;max-width:600px">';
-  html += '<div style="background:#2563eb;color:white;padding:16px 20px;border-radius:8px 8px 0 0">';
-  html += '<h2 style="margin:0;font-size:18px">Inventory Reminder</h2>';
-  html += '<p style="margin:4px 0 0;font-size:12px;opacity:0.9">' + todayStr + '</p>';
-  html += '</div>';
-  html += '<div style="border:1px solid #e2e8f0;border-top:none;padding:20px;border-radius:0 0 8px 8px">';
-
-  html += '<p style="font-size:14px">Hello ' + escapeHtml(ownerName) + ',</p>';
-  html += '<p style="font-size:14px">You have <b>' + totalAlerts + '</b> alert(s) in your Home Inventory:</p>';
-
-  if (expiringItems.length > 0) {
-    html += '<h3 style="color:#dc2626;font-size:14px;margin-top:16px">Expiring Items</h3>';
-    html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
-    html += '<tr style="background:#fef2f2"><th style="text-align:left;padding:6px;border:1px solid #fecaca">Item</th><th style="text-align:left;padding:6px;border:1px solid #fecaca">Location</th><th style="text-align:left;padding:6px;border:1px solid #fecaca">Expiry</th><th style="text-align:left;padding:6px;border:1px solid #fecaca">Days</th></tr>';
-    expiringItems.forEach(function(ei) {
-      html += '<tr>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0"><b>' + escapeHtml(ei.name) + '</b><br><span style="color:#64748b;font-size:10px">' + escapeHtml(ei.category) + '</span></td>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0">' + escapeHtml(ei.location) + '</td>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0">' + ei.expiryDate + '</td>';
-      var daysColor = (ei.daysLeft <= 0) ? '#dc2626' : '#d97706';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0;color:' + daysColor + ';font-weight:bold">' + ei.daysLeft + 'd</td>';
-      html += '</tr>';
-    });
-    html += '</table>';
-  }
-
-  if (lowStockItems.length > 0) {
-    html += '<h3 style="color:#d97706;font-size:14px;margin-top:16px">Low Stock</h3>';
-    html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
-    html += '<tr style="background:#fffbeb"><th style="text-align:left;padding:6px;border:1px solid #fde68a">Item</th><th style="text-align:left;padding:6px;border:1px solid #fde68a">Current</th><th style="text-align:left;padding:6px;border:1px solid #fde68a">Min</th><th style="text-align:left;padding:6px;border:1px solid #fde68a">Shortage</th></tr>';
-    lowStockItems.forEach(function(lsi) {
-      var shortage = Math.max(0, lsi.minQuantity - lsi.quantity);
-      html += '<tr>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0"><b>' + escapeHtml(lsi.name) + '</b><br><span style="color:#64748b;font-size:10px">' + escapeHtml(lsi.category) + '</span></td>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0">' + lsi.quantity + ' ' + escapeHtml(lsi.uom) + '</td>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0">' + lsi.minQuantity + '</td>';
-      html += '<td style="padding:6px;border:1px solid #e2e8f0;color:#dc2626;font-weight:bold">-' + shortage + ' ' + escapeHtml(lsi.uom) + '</td>';
-      html += '</tr>';
-    });
-    html += '</table>';
-  }
-
-  html += '<p style="font-size:11px;color:#94a3b8;margin-top:20px;border-top:1px solid #e2e8f0;padding-top:12px">Sent by Find My Item — ' + new Date().toLocaleString() + '</p>';
-  html += '</div></body></html>';
-
-  return html;
-}
-
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-/**
- * Time-driven trigger entry point. Reads stored data from the Data sheet
- * and sends expiry / low-stock reminder emails.
- */
-function checkAndRemind() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(CONFIG.dataSheet);
-  if (!sheet) {
-    console.log('No Data sheet found.');
-    return;
-  }
-
-  var chunkCount = parseInt(sheet.getRange('B2').getValue(), 10) || 1;
-  var fullData = '';
-
-  for (var i = 0; i < chunkCount; i++) {
-    fullData += sheet.getRange(i + 1, 1).getValue();
-  }
-
-  if (!fullData) {
-    console.log('No data stored in sheet.');
-    return;
-  }
-
-  var data;
-  try {
-    data = JSON.parse(fullData);
-  } catch (ex) {
-    console.log('Failed to parse stored data: ' + ex);
-    return;
-  }
-
-  var inventory = data.inventory || [];
-  var reminderDays = data.reminderDays || 30;
-  var userEmails = data.userEmails || {};
-
-  sendExpiryReminders(inventory, reminderDays, userEmails);
-  sendLowStockReminders(inventory, userEmails);
-}
-
-/**
- * Installs a daily time trigger to run checkAndRemind automatically.
- * Run once from the Apps Script editor to activate.
- */
-function setupTimeTrigger() {
-  var triggers = ScriptApp.getProjectTriggers();
-  triggers.forEach(function(t) {
-    if (t.getHandlerFunction() === 'checkAndRemind') {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
-
-  ScriptApp.newTrigger('checkAndRemind')
-    .timeBased()
-    .atHour(7)
-    .everyDays(1)
-    .create();
-
-  console.log('Daily expiry / low-stock reminder trigger installed. Runs ~7 AM daily.');
-}
-
-// ─── Reminder Helpers ───────────────────────────────────────────────────────
-
-function sumStockQuantity(item) {
-  if (!item || item.itemType !== 'stock') return item.quantity || 0;
-  var entries = (item.stockEntries && Array.isArray(item.stockEntries) ? item.stockEntries : []);
-  var total = 0;
-  for (var i = 0; i < entries.length; i++) {
-    if (!entries[i].hiddenAt) total += entries[i].quantity || 0;
-  }
-  return total;
-}
-
-function getStockLocationLabel(entry) {
-  if (!entry) return '';
-  var parts = [entry.segment, entry.container, entry.subContainer].filter(function(p) { return !!p; });
-  return parts.join(' > ') || '—';
-}
-
-function getItemExpiryDates(item) {
-  var results = [];
-  if (!item || item.deletedAt) return results;
-  if (item.itemType !== 'stock' && item.expiryDate) {
-    results.push({ locationLabel: null, expiryDate: item.expiryDate });
-  }
-  if (item.itemType === 'stock' && item.stockEntries && Array.isArray(item.stockEntries)) {
-    for (var i = 0; i < item.stockEntries.length; i++) {
-      var e = item.stockEntries[i];
-      if (!e.hiddenAt && e.expiryDate) {
-        results.push({ locationLabel: getStockLocationLabel(e), expiryDate: e.expiryDate });
-      }
-    }
-  }
-  return results;
-}
-
-function getItemOwnerEmail(owner, userEmails) {
-  if (!owner || owner === 'Default') return '';
-  return (userEmails && userEmails[owner]) || '';
-}
-
-function sendExpiryReminders(inventory, reminderDays, userEmails) {
-  if (!inventory || !inventory.length) return;
-  reminderDays = reminderDays || 30;
-  userEmails = userEmails || {};
-
-  var tz = Session.getScriptTimeZone();
-  var now = new Date();
-  var todayStr = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
-  var cutoff = new Date(now.getTime() + reminderDays * 86400000);
-  var cutoffStr = Utilities.formatDate(cutoff, tz, 'yyyy-MM-dd');
-
-  // Collect all expiring items with per-entry granularity for stock items.
-  var expiring = [];
-  inventory.forEach(function(item) {
-    if (item.deletedAt) return;
-    var expiryDates = getItemExpiryDates(item);
-    expiryDates.forEach(function(ed) {
-      if (ed.expiryDate >= todayStr && ed.expiryDate <= cutoffStr) {
-        expiring.push({
-          item: item,
-          expiryDate: ed.expiryDate,
-          locationLabel: ed.locationLabel
-        });
-      }
-    });
-  });
-
-  if (!expiring.length) { console.log('No items expiring within ' + reminderDays + ' days.'); return; }
-
-  var reminded = getRemindedRecords('expiry');
-  expiring = expiring.filter(function(rec) {
-    var key = rec.item.id + '|' + rec.expiryDate;
-    if (rec.locationLabel) key += '|' + rec.locationLabel;
-    return reminded.indexOf(key) === -1;
-  });
-
-  if (!expiring.length) { console.log('All expiring items already reminded.'); return; }
-
-  var byOwner = {};
-  expiring.forEach(function(rec) {
-    var owner = rec.item.owner || 'Default';
-    var email = getItemOwnerEmail(owner, userEmails);
-    if (!email) {
-      // Default owner routes to all configured emails.
-      var allEmails = Object.values(userEmails).filter(function(e) { return e && e.indexOf('@') > 0; });
-      if (!allEmails.length) {
-        console.log('No email for owner ' + owner + ', skipping: ' + rec.item.name);
-        return;
-      }
-      allEmails.forEach(function(e) {
-        if (!byOwner[e]) byOwner[e] = [];
-        byOwner[e].push(rec);
-      });
-    } else {
-      if (!byOwner[email]) byOwner[email] = [];
-      byOwner[email].push(rec);
-    }
-  });
-
-  var tz2 = Session.getScriptTimeZone();
-  var todayStr2 = Utilities.formatDate(new Date(), tz2, 'yyyy-MM-dd');
-  var newReminders = [];
-
-  Object.keys(byOwner).forEach(function(toEmail) {
-    var recs = byOwner[toEmail];
-    var itemsList = recs.map(function(rec) {
-      var it = rec.item;
-      var key = it.id + '|' + rec.expiryDate;
-      if (rec.locationLabel) key += '|' + rec.locationLabel;
-      newReminders.push([key, 'expiry', todayStr2, it.name || '']);
-      var row = '- ' + (it.name || '') + ' | expiry: ' + rec.expiryDate;
-      if (rec.locationLabel) row += ' | location: ' + rec.locationLabel;
-      else row += ' | location: ' + [it.segment, it.container, it.subContainer].filter(function(p) { return !!p; }).join(' / ');
-      row += ' | category: ' + (it.category || '');
-      return row;
-    }).join('\n');
-
-    var subject = 'Expiry Reminder: ' + recs.length + ' item(s) expiring within ' + reminderDays + ' days';
-    var body = 'The following items are expiring soon:\n\n' + itemsList + '\n\n-- Sent by Find My Item';
-
-    try {
-      MailApp.sendEmail(toEmail, subject, body);
-      console.log('Expiry email sent to ' + toEmail + ' (' + recs.length + ' items)');
-    } catch (ex) { console.log('Expiry email send error to ' + toEmail + ': ' + ex); }
-  });
-
-  if (newReminders.length) saveRemindedRecords(newReminders);
-}
-
-function sendLowStockReminders(inventory, userEmails) {
-  if (!inventory || !inventory.length) return;
-  userEmails = userEmails || {};
-
-  var tz = Session.getScriptTimeZone();
-  var todayStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-
-  var activeLowStockKeys = getActiveLowStockKeys();
-  var lowStockItems = [];
-  var recoveredKeys = [];
-
-  inventory.forEach(function(item) {
-    if (!item || item.deletedAt || item.itemType !== 'stock') return;
-    var qty = sumStockQuantity(item);
-    var minQty = Number(item.minQuantity || 0);
-    var key = item.id + '|low';
-    if (qty <= minQty && minQty > 0) {
-      if (activeLowStockKeys.indexOf(key) === -1) lowStockItems.push(item);
-    } else {
-      if (activeLowStockKeys.indexOf(key) !== -1) recoveredKeys.push(key);
-    }
-  });
-
-  if (recoveredKeys.length) {
-    clearLowStockReminderKeys(recoveredKeys);
-    console.log('Cleared recovered low-stock keys: ' + recoveredKeys.join(', '));
-  }
-
-  if (!lowStockItems.length) { console.log('No new low-stock items to alert.'); return; }
-
-  var byOwner = {};
-  lowStockItems.forEach(function(item) {
-    var owner = item.owner || 'Default';
-    var email = getItemOwnerEmail(owner, userEmails);
-    if (!email) {
-      var allEmails = Object.values(userEmails).filter(function(e) { return e && e.indexOf('@') > 0; });
-      if (!allEmails.length) {
-        console.log('No email for owner ' + owner + ', skipping low-stock: ' + item.name);
-        return;
-      }
-      allEmails.forEach(function(e) {
-        if (!byOwner[e]) byOwner[e] = [];
-        byOwner[e].push(item);
-      });
-    } else {
-      if (!byOwner[email]) byOwner[email] = [];
-      byOwner[email].push(item);
-    }
-  });
-
-  var newReminders = [];
-  Object.keys(byOwner).forEach(function(toEmail) {
-    var items = byOwner[toEmail];
-    var itemsList = items.map(function(item) {
-      var key = item.id + '|low';
-      newReminders.push([key, 'stock', todayStr, item.name || '']);
-      var qty = sumStockQuantity(item);
-      // Build location from stock entries.
-      var entries = (item.stockEntries && Array.isArray(item.stockEntries) ? item.stockEntries : []);
-      var locs = [];
-      for (var i = 0; i < entries.length; i++) {
-        if (!entries[i].hiddenAt) locs.push(getStockLocationLabel(entries[i]));
-      }
-      return '- ' + (item.name || '') +
-             ' | stock: ' + qty + ' ' + (item.uom || 'pcs') +
-             ' | min: ' + (item.minQuantity || 0) +
-             ' | category: ' + (item.category || '') +
-             ' | location: ' + (locs.length ? locs.join('; ') : '—');
-    }).join('\n');
-
-    var subject = 'Low Stock Alert: ' + items.length + ' item(s) need reorder';
-    var body = 'The following stock items are at or below minimum level:\n\n' + itemsList + '\n\nPlease reorder soon.\n\n-- Sent by Find My Item';
-
-    try {
-      MailApp.sendEmail(toEmail, subject, body);
-      console.log('Low-stock email sent to ' + toEmail + ' (' + items.length + ' items)');
-    } catch (ex) { console.log('Low-stock email error to ' + toEmail + ': ' + ex); }
-  });
-
-  if (newReminders.length) saveRemindedRecords(newReminders);
-}
-
-// ─── Reminder Record Helpers ────────────────────────────────────────────────
-
-function getRemindedRecords(type) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('Reminders');
-  if (!sheet) return [];
-
-  var lastRow = Math.max(sheet.getLastRow(), 1);
-  if (lastRow < 2) return [];
-
-  var data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
-  var keys = [];
-  data.forEach(function(row) {
-    var key = String(row[0] || '');
-    if (key && row[1] === type) keys.push(key);
-  });
-  return keys;
-}
-
-function getActiveLowStockKeys() {
-  return getRemindedRecords('stock');
-}
-
-function clearLowStockReminderKeys(keysToRemove) {
-  if (!keysToRemove || !keysToRemove.length) return;
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('Reminders');
-  if (!sheet) return;
-
-  var lastRow = Math.max(sheet.getLastRow(), 1);
-  if (lastRow < 2) return;
-
-  var data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
-  var rowsToKeep = [];
-  data.forEach(function(row) {
-    if (row[1] === 'stock' && keysToRemove.indexOf(String(row[0] || '')) !== -1) return;
-    rowsToKeep.push(row);
-  });
-
-  sheet.getRange(2, 1, Math.max(lastRow - 1, 1), 4).clearContent();
-  if (rowsToKeep.length) {
-    sheet.getRange(2, 1, rowsToKeep.length, 4).setValues(rowsToKeep);
-  }
-}
-
-function saveRemindedRecords(records) {
-  if (!records || !records.length) return;
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('Reminders');
-  if (!sheet) {
-    sheet = ss.insertSheet('Reminders');
-    sheet.getRange(1, 1, 1, 4).setValues([['Key', 'Type', 'Date', 'Name']]);
-    sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
-  }
-  var lastRow = Math.max(sheet.getLastRow(), 1);
-  sheet.getRange(lastRow + 1, 1, records.length, 4).setValues(records);
+  return { success: true, sent: sent, recipients: sent };
 }
