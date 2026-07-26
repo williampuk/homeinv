@@ -23,6 +23,7 @@ jobs:
           node --check sync-v3-core.js
           node --check sync-v3.js
           node --check sync-v3-import-adapter.js
+          node --check sync-v3-endpoint-guard.js
           node --check service-worker.js
           cp GoogleSheetSync.gs /tmp/GoogleSheetSync.js
           node --check /tmp/GoogleSheetSync.js
@@ -32,6 +33,8 @@ jobs:
         run: node tests/sync-v3-browser-integration.test.js
       - name: Run Excel import adapter tests
         run: node tests/sync-v3-import-adapter.test.js
+      - name: Run endpoint guard tests
+        run: node tests/sync-v3-endpoint-guard.test.js
       - name: Run Apps Script sync tests
         run: |
           cp GoogleSheetSync.gs GoogleSheetSync.js
