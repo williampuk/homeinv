@@ -27,7 +27,10 @@ jobs:
           node --check /tmp/GoogleSheetSync.js
       - name: Run browser sync core tests
         run: node tests/sync-v3-core.test.js
+      - name: Run browser sync integration tests
+        run: node tests/sync-v3-browser-integration.test.js
       - name: Run Apps Script sync tests
         run: |
           cp GoogleSheetSync.gs GoogleSheetSync.js
           node tests/google-sheet-sync-v3.test.js
+          rm GoogleSheetSync.js
