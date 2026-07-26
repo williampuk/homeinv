@@ -6,42 +6,104 @@
     return;
   }
 
+  window.__HOMEINV_SYNC_V3__ = true;
+
   var Core = window.SyncV3Core;
-  var CANONICAL_KEY = 'fmi_sync_v3_canonical';
-  var CLOUD_INITIALIZED_KEY = 'fmi_sync_v3_initialized';
-  var _syncV3Queue = Promise.resolve();
-  var _syncV3ProtocolError = false;
-  var _syncV3CloudInitialized = localStorage.getItem(CLOUD_INITIALIZED_KEY) === '1';
-  var _syncV3TaskDepth = 0;
-  var _syncV3ConflictPanel = null;
+  var CANONICAL_RECORD_KEY = 'syncV3CanonicalByEndpoint';
+  var BASELINE_RECORD_KEY = 'syncV3LocalBaselineByEndpoint';
+  var LEGACY_CANONICAL_KEY = 'fmi_sync_v3_canonical';
+  var LEGACY_INITIALIZED_KEY = 'fmi_sync_v3_initialized';
+  var LOCAL_SCOPE = '__local_unconfigured__';
+  var MAX_PUSH_OPERATIONS = 100;
+  var REQUEST_TIMEOUT_MS = 30000;
+
+  var _canonicalByEndpoint = {};
+  var _baselineByEndpoint = {};
+  var _syncQueue = Promise.resolve();
+  var _mutationQueue = Promise.resolve();
+  var _taskDepth = 0;
+  var _protocolError = false;
+  var _cloudInitialized = false;
+  var _conflictPanel = null;
+  var _lastSuccessfulEndpoint = '';
 
   function clone(value) { return Core.clone(value); }
+  function currentEndpoint() { return String(localStorage.getItem('sys_gas_url') || ''); }
+  function currentScope() { return currentEndpoint() || LOCAL_SCOPE; }
 
-  function enqueueSyncTask(task) {
-    _syncV3Queue = _syncV3Queue.catch(function() {}).then(function() {
-      _syncV3TaskDepth += 1;
-      return Promise.resolve().then(task).finally(function() {
-        _syncV3TaskDepth -= 1;
+  function getStateRecord(key) {
+    return openStateDb().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction('appState', 'readonly');
+        var req = tx.objectStore('appState').get(key);
+        req.onsuccess = function() { resolve(req.result ? req.result.value : null); };
+        req.onerror = function() { reject(req.error); };
       });
     });
-    return _syncV3Queue;
   }
 
-  function getCanonicalSnapshot() {
+  function putStateRecord(key, value) {
+    return openStateDb().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction('appState', 'readwrite');
+        tx.objectStore('appState').put({ key: key, value: value });
+        tx.oncomplete = function() { resolve(); };
+        tx.onerror = function() { reject(tx.error); };
+        tx.onabort = function() { reject(tx.error || new Error('IndexedDB transaction aborted.')); };
+      });
+    });
+  }
+
+  function loadRecordMap(value) {
+    if (!value || typeof value !== 'object') return {};
+    if (value.records && typeof value.records === 'object') return clone(value.records);
+    return clone(value);
+  }
+
+  function persistCanonicalMap() {
+    var value = { records: clone(_canonicalByEndpoint) };
+    try { localStorage.setItem(LEGACY_CANONICAL_KEY, JSON.stringify(value)); } catch (ignore) {}
+    return putStateRecord(CANONICAL_RECORD_KEY, value);
+  }
+
+  function persistBaselineMap() {
+    return putStateRecord(BASELINE_RECORD_KEY, { records: clone(_baselineByEndpoint) });
+  }
+
+  function loadLegacyCanonicalMap() {
     try {
-      var raw = localStorage.getItem(CANONICAL_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) {
-      console.warn('[SyncV3] Invalid canonical cache:', e);
-      return null;
-    }
+      var raw = localStorage.getItem(LEGACY_CANONICAL_KEY);
+      if (!raw) return {};
+      var value = JSON.parse(raw);
+      if (value && value.records) return loadRecordMap(value);
+      var endpoint = currentEndpoint();
+      if (endpoint && value && value.protocolVersion === Core.PROTOCOL_VERSION) {
+        var migrated = {};
+        migrated[endpoint] = value;
+        return migrated;
+      }
+    } catch (ignore) {}
+    return {};
   }
 
-  function putCanonicalSnapshot(snapshot) {
-    if (!snapshot) return;
-    localStorage.setItem(CANONICAL_KEY, JSON.stringify(snapshot));
-    localStorage.setItem(CLOUD_INITIALIZED_KEY, '1');
-    _syncV3CloudInitialized = true;
+  var _storageReady = Promise.all([
+    getStateRecord(CANONICAL_RECORD_KEY).catch(function() { return null; }),
+    getStateRecord(BASELINE_RECORD_KEY).catch(function() { return null; })
+  ]).then(function(values) {
+    _canonicalByEndpoint = loadRecordMap(values[0]);
+    if (!Object.keys(_canonicalByEndpoint).length) _canonicalByEndpoint = loadLegacyCanonicalMap();
+    _baselineByEndpoint = loadRecordMap(values[1]);
+    _cloudInitialized = !!getCanonicalSnapshot();
+  });
+
+  function emptySharedSnapshot() {
+    return {
+      protocolVersion: Core.PROTOCOL_VERSION,
+      schemaVersion: '3.0.0',
+      meta: { initialized: false, serverSeq: 0, locationsVersion: 0, categoriesVersion: 0, householdSettingsVersion: 0 },
+      segments: {}, coordinates: {}, spatialBackgroundImage: null, categories: {}, inventory: [],
+      users: ['Default'], userEmails: {}, reminderDays: 30
+    };
   }
 
   function sharedSnapshotFromState(state) {
@@ -67,38 +129,97 @@
     };
   }
 
+  function getCanonicalSnapshot() {
+    var endpoint = currentEndpoint();
+    return endpoint && _canonicalByEndpoint[endpoint] ? clone(_canonicalByEndpoint[endpoint]) : null;
+  }
+
+  function putCanonicalSnapshot(snapshot) {
+    var endpoint = currentEndpoint();
+    if (!endpoint || !snapshot) return Promise.resolve();
+    _canonicalByEndpoint[endpoint] = clone(snapshot);
+    _cloudInitialized = true;
+    _lastSuccessfulEndpoint = endpoint;
+    localStorage.setItem(LEGACY_INITIALIZED_KEY, endpoint);
+    return persistCanonicalMap();
+  }
+
+  function getLocalBaseline() {
+    var key = currentScope();
+    return _baselineByEndpoint[key] ? clone(_baselineByEndpoint[key]) : null;
+  }
+
+  function putLocalBaseline(snapshot) {
+    _baselineByEndpoint[currentScope()] = clone(snapshot);
+    return persistBaselineMap();
+  }
+
+  function clearLocalBaseline() {
+    delete _baselineByEndpoint[currentScope()];
+    return persistBaselineMap().catch(function() {});
+  }
+
+  function ensureLocalBaseline(previousState) {
+    var baseline = getLocalBaseline();
+    if (baseline) return Promise.resolve(baseline);
+    baseline = previousState ? sharedSnapshotFromState(previousState) : emptySharedSnapshot();
+    return putLocalBaseline(baseline).then(function() { return clone(baseline); });
+  }
+
   function preserveLocalFields(snapshot) {
-    var old = window.appState || appState || {};
-    var projected = clone(snapshot || {});
-    projected.meta = projected.meta || {};
-    projected.meta.deviceId = old.meta && old.meta.deviceId || getDeviceId();
-    projected.meta.lastSyncedAt = new Date().toISOString();
-    projected.meta.lastServerRevision = Number(snapshot && snapshot.meta && snapshot.meta.serverSeq || 0);
-    projected.meta.serverSeq = projected.meta.lastServerRevision;
-    projected.meta.structureVersion = Number(snapshot && snapshot.meta && snapshot.meta.locationsVersion || 0);
-    projected.meta.locationsVersion = projected.meta.structureVersion;
-    projected.meta.categoryVersion = Number(snapshot && snapshot.meta && snapshot.meta.categoriesVersion || 0);
-    projected.meta.categoriesVersion = projected.meta.categoryVersion;
-    projected.meta.householdSettingsVersion = Number(snapshot && snapshot.meta && snapshot.meta.householdSettingsVersion || 0);
-    projected.currentUser = old.currentUser || 'Default';
-    projected.language = old.language || 'en';
-    projected.selectedCategoryNodePath = clone(old.selectedCategoryNodePath || null);
-    projected.activeMappingNode = clone(old.activeMappingNode || null);
-    projected.reminderLog = clone(old.reminderLog || {});
-    projected.syncQueue = [];
-    projected.syncConflicts = clone(old.syncConflicts || []);
-    return projected;
+    var old = typeof appState !== 'undefined' ? appState : {};
+    var next = clone(snapshot || emptySharedSnapshot());
+    next.meta = next.meta || {};
+    next.meta.deviceId = old.meta && old.meta.deviceId || getDeviceId();
+    next.meta.lastSyncedAt = new Date().toISOString();
+    next.meta.lastServerRevision = Number(next.meta.serverSeq || 0);
+    next.meta.structureVersion = Number(next.meta.locationsVersion || 0);
+    next.meta.categoryVersion = Number(next.meta.categoriesVersion || 0);
+    next.currentUser = old.currentUser || 'Default';
+    next.language = old.language || 'en';
+    next.selectedCategoryNodePath = clone(old.selectedCategoryNodePath || null);
+    next.activeMappingNode = clone(old.activeMappingNode || null);
+    next.reminderLog = clone(old.reminderLog || {});
+    next.syncQueue = [];
+    next.syncConflicts = [];
+    return next;
   }
 
   function isSharedDataEmpty(state) {
     state = state || {};
-    return !(state.inventory && state.inventory.length) &&
-      Object.keys(state.segments || {}).length === 0 &&
-      Object.keys(state.categories || {}).length === 0;
+    return !(state.inventory && state.inventory.length) && Object.keys(state.segments || {}).length === 0 && Object.keys(state.categories || {}).length === 0;
   }
 
-  function postV3(action, payload) {
-    var endpoint = localStorage.getItem('sys_gas_url');
+  function comparableSnapshot(state) {
+    var value = sharedSnapshotFromState(state);
+    delete value.meta;
+    function clean(object) {
+      if (Array.isArray(object)) return object.map(clean);
+      if (!object || typeof object !== 'object') return object;
+      var out = {};
+      Object.keys(object).sort().forEach(function(key) {
+        if (['version', 'createdAt', 'updatedAt', 'lastModifiedBy', 'timestamp'].indexOf(key) >= 0) return;
+        out[key] = clean(object[key]);
+      });
+      return out;
+    }
+    return clean(value);
+  }
+
+  function localMatchesRemoteWithoutBaseline(remote) {
+    return Core.stableStringify(comparableSnapshot(appState)) === Core.stableStringify(comparableSnapshot(remote));
+  }
+
+  function enqueueSyncTask(task) {
+    _syncQueue = _syncQueue.catch(function() {}).then(function() {
+      _taskDepth += 1;
+      return Promise.resolve().then(task).finally(function() { _taskDepth -= 1; });
+    });
+    return _syncQueue;
+  }
+
+  function requestV3(action, payload) {
+    var endpoint = currentEndpoint();
     var token = localStorage.getItem('sys_api_pwd');
     if (!endpoint) return Promise.reject(new Error('No cloud endpoint configured.'));
     if (!token) return Promise.reject(new Error('No API token configured.'));
@@ -107,19 +228,233 @@
     params.append('action', action);
     params.append('protocolVersion', String(Core.PROTOCOL_VERSION));
     params.append('payload', JSON.stringify(payload || {}));
-    return fetch(endpoint, { method: 'POST', body: params }).then(function(resp) {
-      return resp.text().then(function(text) {
-        var json;
-        try { json = JSON.parse(text); }
-        catch (e) { throw new Error('Invalid server response.'); }
-        if (!json.success) {
-          var err = new Error(json.message || json.errorCode || 'Sync failed.');
-          err.code = json.errorCode;
-          err.retryable = !!json.retryable;
-          err.response = json;
-          throw err;
-        }
-        return json;
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = controller ? setTimeout(function() { controller.abort(); }, REQUEST_TIMEOUT_MS) : null;
+    return fetch(endpoint, { method: 'POST', body: params, signal: controller && controller.signal }).then(function(response) {
+      return response.text();
+    }).then(function(text) {
+      var result;
+      try { result = JSON.parse(text); } catch (e) { throw new Error('Invalid server response.'); }
+      if (!result || !result.success) {
+        var error = new Error(result && (result.message || result.errorCode) || 'Synchronization failed.');
+        error.code = result && result.errorCode;
+        error.retryable = !!(result && result.retryable);
+        error.response = result;
+        throw error;
+      }
+      return result;
+    }).catch(function(error) {
+      if (error && error.name === 'AbortError') {
+        var timeout = new Error('Synchronization request timed out.');
+        timeout.code = 'NETWORK_TIMEOUT';
+        timeout.retryable = true;
+        throw timeout;
+      }
+      throw error;
+    }).finally(function() { if (timer) clearTimeout(timer); });
+  }
+
+  function ensureEndpointScope() {
+    return _storageReady.then(function() {
+      var endpoint = currentEndpoint();
+      var scope = currentScope();
+      var changed = false;
+      if (endpoint && _baselineByEndpoint[LOCAL_SCOPE] && !_baselineByEndpoint[endpoint]) {
+        _baselineByEndpoint[endpoint] = _baselineByEndpoint[LOCAL_SCOPE];
+        delete _baselineByEndpoint[LOCAL_SCOPE];
+        changed = true;
+      }
+      return idbGetOutboxOps().then(function(ops) {
+        var writes = [];
+        (ops || []).forEach(function(op) {
+          if (!op.syncEndpoint || op.syncEndpoint === LOCAL_SCOPE) {
+            op.syncEndpoint = scope;
+            writes.push(idbPutOutboxOp(op));
+          }
+        });
+        if (changed) writes.push(persistBaselineMap());
+        return Promise.all(writes).then(function() { return ops || []; });
+      });
+    });
+  }
+
+  function compareEntryMetadata(a, b) {
+    function clean(entry) {
+      entry = clone(entry || {});
+      ['quantity', 'version', 'createdAt', 'updatedAt', 'hiddenAt'].forEach(function(key) { delete entry[key]; });
+      return Core.stableStringify(entry);
+    }
+    return clean(a) === clean(b);
+  }
+
+  function compareItemMetadata(a, b) {
+    function clean(item) {
+      item = clone(item || {});
+      ['quantity', 'stockEntries', 'version', 'createdAt', 'updatedAt', 'deletedAt', 'lastModifiedBy', 'timestamp'].forEach(function(key) { delete item[key]; });
+      return Core.stableStringify(item);
+    }
+    return clean(a) === clean(b);
+  }
+
+  function buildDocumentOperation(type, currentState, projectedBefore, existingOps, deviceId) {
+    var dependency;
+    if (type === Core.OP_TYPES.LOCATIONS_PUT) {
+      dependency = Core.latestDependency(existingOps, 'locations', 'locations');
+      return Core.locationsPut(currentState, Number(projectedBefore.meta && projectedBefore.meta.locationsVersion || 0), deviceId, dependency && dependency.opId);
+    }
+    if (type === Core.OP_TYPES.CATEGORIES_PUT) {
+      dependency = Core.latestDependency(existingOps, 'categories', 'categories');
+      return Core.categoriesPut(currentState, Number(projectedBefore.meta && projectedBefore.meta.categoriesVersion || 0), deviceId, dependency && dependency.opId);
+    }
+    dependency = Core.latestDependency(existingOps, 'householdSettings', 'householdSettings');
+    return Core.householdSettingsPut(currentState, Number(projectedBefore.meta && projectedBefore.meta.householdSettingsVersion || 0), deviceId, dependency && dependency.opId);
+  }
+
+  function buildItemDiffOperations(actionType, metadata, currentState, existingOps, projectedBefore, deviceId) {
+    var itemId = metadata && metadata.itemId;
+    var currentItem = Core.findItem(currentState, itemId);
+    var previousItem = Core.findItem(projectedBefore, itemId);
+    var generated = [];
+    var workingOps = existingOps.slice();
+    var itemDependency = Core.latestItemDependency(workingOps, itemId);
+    if (actionType === 'REMOVE_ITEM') {
+      if (previousItem) generated.push(Core.itemDelete(itemId, Number(previousItem.version || 0), deviceId, itemDependency && itemDependency.opId));
+      return generated;
+    }
+    if (!currentItem) return generated;
+    var itemOperation = null;
+    if (!previousItem || !compareItemMetadata(previousItem, currentItem)) {
+      itemOperation = Core.itemPut(currentItem, previousItem ? Number(previousItem.version || 0) : 0, deviceId, itemDependency && itemDependency.opId);
+      generated.push(itemOperation);
+      workingOps.push(itemOperation);
+    }
+    if (currentItem.itemType !== 'stock') return generated;
+    var oldEntries = {};
+    var newEntries = {};
+    ((previousItem && previousItem.stockEntries) || []).forEach(function(entry) { oldEntries[entry.id] = entry; });
+    (currentItem.stockEntries || []).forEach(function(entry) { newEntries[entry.id] = entry; });
+    Object.keys(oldEntries).forEach(function(entryId) {
+      if (!newEntries[entryId] || newEntries[entryId].hiddenAt) {
+        var oldEntry = oldEntries[entryId];
+        var dependency = Core.latestDependency(workingOps, 'stockEntry', entryId);
+        var operation = Core.stockEntryDelete(itemId, entryId, Number(oldEntry.version || 0), deviceId, dependency && dependency.opId);
+        generated.push(operation);
+        workingOps.push(operation);
+      }
+    });
+    Object.keys(newEntries).forEach(function(entryId) {
+      var nextEntry = newEntries[entryId];
+      if (nextEntry.hiddenAt) return;
+      var oldEntry = oldEntries[entryId];
+      var dependency = Core.latestDependency(workingOps, 'stockEntry', entryId);
+      if (!oldEntry) {
+        var parentDependency = itemOperation && itemOperation.opId || itemDependency && itemDependency.opId || null;
+        var createOperation = Core.stockEntryPut(itemId, nextEntry, 0, Number(nextEntry.quantity || 0), deviceId, parentDependency);
+        generated.push(createOperation);
+        workingOps.push(createOperation);
+        return;
+      }
+      if (!compareEntryMetadata(oldEntry, nextEntry)) {
+        var putOperation = Core.stockEntryPut(itemId, nextEntry, Number(oldEntry.version || 0), 0, deviceId, dependency && dependency.opId);
+        generated.push(putOperation);
+        workingOps.push(putOperation);
+        dependency = putOperation;
+      }
+      var delta = Number(nextEntry.quantity || 0) - Number(oldEntry.quantity || 0);
+      if (delta !== 0) {
+        var adjustOperation = Core.stockAdjust(itemId, entryId, delta, deviceId, dependency && dependency.opId);
+        generated.push(adjustOperation);
+        workingOps.push(adjustOperation);
+      }
+    });
+    return generated;
+  }
+
+  function queueMutation(actionType, metadata, currentState, previousPersistedState) {
+    return ensureEndpointScope().then(function(allOps) {
+      var scope = currentScope();
+      var scopedOps = (allOps || []).filter(function(op) { return op.syncEndpoint === scope; });
+      var canonical = getCanonicalSnapshot();
+      var baselinePromise = canonical ? Promise.resolve(canonical) : ensureLocalBaseline(previousPersistedState);
+      return baselinePromise.then(function(baseline) {
+        var projectedBefore = Core.projectState(baseline, scopedOps);
+        var deviceId = currentState.meta && currentState.meta.deviceId || getDeviceId();
+        var generated = [];
+        var locationActions = ['ADD_SEGMENT', 'RENAME_SEGMENT', 'DELETE_SEGMENT', 'ADD_CONTAINER', 'RENAME_CONTAINER', 'DELETE_CONTAINER', 'ADD_SUBCONTAINER', 'ADD_SUB_CONTAINER', 'RENAME_SUBCONTAINER', 'RENAME_SUB_CONTAINER', 'DELETE_SUBCONTAINER', 'DELETE_SUB_CONTAINER', 'SAVE_LAYOUT', 'UPDATE_COORDINATE', 'UPDATE_BACKGROUND_IMAGE'];
+        var categoryActions = ['ADD_CATEGORY', 'DELETE_CATEGORY', 'SAVE_CLASSIFICATION'];
+        var settingsActions = ['ADD_USER', 'REMOVE_USER', 'SET_REMINDER'];
+        if (locationActions.indexOf(actionType) >= 0) generated = [buildDocumentOperation(Core.OP_TYPES.LOCATIONS_PUT, currentState, projectedBefore, scopedOps, deviceId)];
+        else if (categoryActions.indexOf(actionType) >= 0) generated = [buildDocumentOperation(Core.OP_TYPES.CATEGORIES_PUT, currentState, projectedBefore, scopedOps, deviceId)];
+        else if (settingsActions.indexOf(actionType) >= 0) generated = [buildDocumentOperation(Core.OP_TYPES.HOUSEHOLD_SETTINGS_PUT, currentState, projectedBefore, scopedOps, deviceId)];
+        else if (['COMMIT_ITEM', 'EDIT_ITEM', 'REMOVE_ITEM', 'STOCK_IN', 'STOCK_OUT'].indexOf(actionType) >= 0) generated = buildItemDiffOperations(actionType, metadata || {}, currentState, scopedOps, projectedBefore, deviceId);
+        generated.forEach(function(op) { op.syncEndpoint = scope; });
+        return Core.sortOperations(generated);
+      });
+    });
+  }
+
+  function persistStateAndOperationsAtomically(state, operations) {
+    return openStateDb().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction(['appState', 'outbox'], 'readwrite');
+        tx.objectStore('appState').put({ key: 'canonical', value: buildPersistedStateSnapshot(state) });
+        (operations || []).forEach(function(op) { tx.objectStore('outbox').put(op); });
+        tx.oncomplete = function() { resolve(); };
+        tx.onerror = function() { reject(tx.error); };
+        tx.onabort = function() { reject(tx.error || new Error('State/outbox transaction aborted.')); };
+      });
+    });
+  }
+
+  window.mutateState = function(actionType, metadata) {
+    appState.meta = appState.meta || {};
+    appState.meta.deviceId = appState.meta.deviceId || getDeviceId();
+    appState.meta.lastLocalChangeAt = new Date().toISOString();
+    appState.meta.lastChangeBy = appState.meta.deviceId;
+    saveStateToLocalStorage();
+    var currentState = clone(appState);
+    _mutationQueue = _mutationQueue.catch(function() {}).then(function() {
+      return idbGetAppState().catch(function() { return null; }).then(function(previousState) {
+        if (actionType === 'SWITCH_USER' || actionType === 'SWITCH_LANGUAGE') return persistStateAndOperationsAtomically(currentState, []).then(function() { return []; });
+        return queueMutation(actionType, metadata || {}, currentState, previousState).then(function(generated) {
+          return persistStateAndOperationsAtomically(currentState, generated).then(function() { return generated; });
+        });
+      }).then(function(generated) {
+        updatePillSyncStatus();
+        updateSyncStatusBadge();
+        if (generated.length && navigator.onLine) return window.flushOutbox();
+      });
+    }).catch(function(error) {
+      _syncLastFailed = true;
+      console.error('[SyncV3] Failed to persist mutation:', error);
+      showToast('Local save failed: ' + error.message, 'error');
+      updatePillSyncStatus();
+      updateSyncStatusBadge();
+    });
+    return _mutationQueue;
+  };
+
+  function scopedOperations(ops) {
+    var scope = currentScope();
+    return (ops || []).filter(function(op) { return op.syncEndpoint === scope; });
+  }
+
+  function problemOperations(ops) {
+    var endpoint = currentScope();
+    return (ops || []).filter(function(op) { return op.syncEndpoint !== endpoint || ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0; });
+  }
+
+  function applyCanonicalAndProject(snapshot) {
+    return putCanonicalSnapshot(snapshot).then(clearLocalBaseline).then(idbGetOutboxOps).then(function(ops) {
+      var projected = Core.projectState(snapshot, scopedOperations(ops));
+      var next = preserveLocalFields(projected);
+      next.syncConflicts = problemOperations(ops).map(function(op) { return op.lastResult || op; });
+      appState = next;
+      window.appState = appState;
+      normalizeAllItemImageFields();
+      saveStateToLocalStorage();
+      return idbPutAppState(buildPersistedStateSnapshot(appState)).then(function() {
+        syncUIComponents(); updatePillSyncStatus(); updateSyncStatusBadge(); updateLoginSyncStatus();
       });
     });
   }
@@ -131,569 +466,282 @@
     return idbPutOutboxOp(op);
   }
 
-  function compareEntryMetadata(a, b) {
-    function clean(entry) {
-      entry = clone(entry || {});
-      ['quantity', 'version', 'createdAt', 'updatedAt', 'hiddenAt'].forEach(function(k) { delete entry[k]; });
-      return entry;
-    }
-    return JSON.stringify(clean(a)) === JSON.stringify(clean(b));
-  }
-
-  function compareItemMetadata(a, b) {
-    function clean(item) {
-      item = clone(item || {});
-      ['quantity', 'stockEntries', 'version', 'createdAt', 'updatedAt', 'deletedAt', 'lastModifiedBy', 'timestamp'].forEach(function(k) { delete item[k]; });
-      return item;
-    }
-    return JSON.stringify(clean(a)) === JSON.stringify(clean(b));
-  }
-
-  function persistOperations(operations) {
-    return operations.reduce(function(chain, op) {
-      return chain.then(function() { return idbPutOutboxOp(op); });
-    }, Promise.resolve());
-  }
-
-  function dependencyFor(ops, entityType, entityId) {
-    return Core.latestDependency(ops, entityType, entityId);
-  }
-
-  function makeDocumentOperation(type, currentState, canonical, ops, deviceId) {
-    var entityType;
-    var version;
-    var dep;
-    if (type === Core.OP_TYPES.LOCATIONS_PUT) {
-      entityType = 'locations';
-      dep = dependencyFor(ops, entityType, entityType);
-      version = Core.nextBaseVersion(canonical && canonical.meta && canonical.meta.locationsVersion || 0, dep);
-      return Core.locationsPut(currentState, version, deviceId, dep && dep.opId);
-    }
-    if (type === Core.OP_TYPES.CATEGORIES_PUT) {
-      entityType = 'categories';
-      dep = dependencyFor(ops, entityType, entityType);
-      version = Core.nextBaseVersion(canonical && canonical.meta && canonical.meta.categoriesVersion || 0, dep);
-      return Core.categoriesPut(currentState, version, deviceId, dep && dep.opId);
-    }
-    entityType = 'householdSettings';
-    dep = dependencyFor(ops, entityType, entityType);
-    version = Core.nextBaseVersion(canonical && canonical.meta && canonical.meta.householdSettingsVersion || 0, dep);
-    return Core.householdSettingsPut(currentState, version, deviceId, dep && dep.opId);
-  }
-
-  function buildItemDiffOperations(actionType, metadata, currentState, existingOps, projectedBefore, deviceId) {
-    var itemId = metadata && metadata.itemId;
-    var currentItem = Core.findItem(currentState, itemId);
-    var previousItem = Core.findItem(projectedBefore, itemId);
-    var generated = [];
-    var workingOps = existingOps.slice();
-    var itemDep = dependencyFor(workingOps, 'item', itemId);
-
-    if (actionType === 'REMOVE_ITEM') {
-      generated.push(Core.itemDelete(
-        itemId,
-        Core.nextBaseVersion(previousItem && previousItem.version || 0, itemDep),
-        deviceId,
-        itemDep && itemDep.opId
-      ));
-      return generated;
-    }
-
-    if (!currentItem) return generated;
-
-    var itemOp = null;
-    var itemBase = Core.nextBaseVersion(previousItem && previousItem.version || 0, itemDep);
-    if (!previousItem || !compareItemMetadata(previousItem, currentItem)) {
-      itemOp = Core.itemPut(currentItem, previousItem ? itemBase : 0, deviceId, itemDep && itemDep.opId);
-      generated.push(itemOp);
-      workingOps.push(itemOp);
-    }
-
-    if (currentItem.itemType !== 'stock') return generated;
-
-    var oldEntries = {};
-    var newEntries = {};
-    ((previousItem && previousItem.stockEntries) || []).forEach(function(entry) { oldEntries[entry.id] = entry; });
-    (currentItem.stockEntries || []).forEach(function(entry) { newEntries[entry.id] = entry; });
-
-    Object.keys(oldEntries).forEach(function(entryId) {
-      if (!newEntries[entryId] || newEntries[entryId].hiddenAt) {
-        var oldEntry = oldEntries[entryId];
-        var entryDep = dependencyFor(workingOps, 'stockEntry', entryId);
-        var deleteOp = Core.stockEntryDelete(
-          itemId,
-          entryId,
-          Core.nextBaseVersion(oldEntry.version || 0, entryDep),
-          deviceId,
-          entryDep && entryDep.opId
-        );
-        generated.push(deleteOp);
-        workingOps.push(deleteOp);
-      }
-    });
-
-    Object.keys(newEntries).forEach(function(entryId) {
-      var nextEntry = newEntries[entryId];
-      if (nextEntry.hiddenAt) return;
-      var oldEntry = oldEntries[entryId];
-      var entryDep = dependencyFor(workingOps, 'stockEntry', entryId);
-      if (!oldEntry) {
-        // A stock entry created with a new item must wait for the parent item.
-        var parentDependency = itemOp && itemOp.opId || itemDep && itemDep.opId || null;
-        var createOp = Core.stockEntryPut(itemId, nextEntry, 0, Number(nextEntry.quantity || 0), deviceId, parentDependency);
-        generated.push(createOp);
-        workingOps.push(createOp);
-        return;
-      }
-      if (!compareEntryMetadata(oldEntry, nextEntry)) {
-        var putOp = Core.stockEntryPut(
-          itemId,
-          nextEntry,
-          Core.nextBaseVersion(oldEntry.version || 0, entryDep),
-          0,
-          deviceId,
-          entryDep && entryDep.opId
-        );
-        generated.push(putOp);
-        workingOps.push(putOp);
-        entryDep = putOp;
-      }
-      var delta = Number(nextEntry.quantity || 0) - Number(oldEntry.quantity || 0);
-      if (delta !== 0) {
-        var adjustOp = Core.stockAdjust(itemId, entryId, delta, deviceId, entryDep && entryDep.opId);
-        generated.push(adjustOp);
-        workingOps.push(adjustOp);
-      }
-    });
-
-    return generated;
-  }
-
-  function queueMutation(actionType, metadata, currentState) {
-    return idbGetOutboxOps().then(function(ops) {
-      ops = ops || [];
-      var canonical = getCanonicalSnapshot() || sharedSnapshotFromState(currentState);
-      var projectedBefore = Core.projectState(canonical, ops);
-      var deviceId = currentState.meta && currentState.meta.deviceId || getDeviceId();
-      var locationActions = ['ADD_SEGMENT', 'RENAME_SEGMENT', 'DELETE_SEGMENT', 'ADD_CONTAINER', 'RENAME_CONTAINER', 'DELETE_CONTAINER', 'ADD_SUBCONTAINER', 'ADD_SUB_CONTAINER', 'RENAME_SUBCONTAINER', 'RENAME_SUB_CONTAINER', 'DELETE_SUBCONTAINER', 'DELETE_SUB_CONTAINER', 'SAVE_LAYOUT', 'UPDATE_COORDINATE', 'UPDATE_BACKGROUND_IMAGE'];
-      var categoryActions = ['ADD_CATEGORY', 'DELETE_CATEGORY', 'SAVE_CLASSIFICATION'];
-      var settingActions = ['ADD_USER', 'REMOVE_USER', 'SET_REMINDER'];
-      var generated = [];
-
-      if (locationActions.indexOf(actionType) >= 0) {
-        generated = [makeDocumentOperation(Core.OP_TYPES.LOCATIONS_PUT, currentState, canonical, ops, deviceId)];
-      } else if (categoryActions.indexOf(actionType) >= 0) {
-        generated = [makeDocumentOperation(Core.OP_TYPES.CATEGORIES_PUT, currentState, canonical, ops, deviceId)];
-      } else if (settingActions.indexOf(actionType) >= 0) {
-        generated = [makeDocumentOperation(Core.OP_TYPES.HOUSEHOLD_SETTINGS_PUT, currentState, canonical, ops, deviceId)];
-      } else if (['COMMIT_ITEM', 'EDIT_ITEM', 'REMOVE_ITEM', 'STOCK_IN', 'STOCK_OUT'].indexOf(actionType) >= 0) {
-        generated = buildItemDiffOperations(actionType, metadata || {}, currentState, ops, projectedBefore, deviceId);
-      }
-
-      return persistOperations(Core.sortOperations(generated)).then(function() {
-        return generated;
-      });
-    });
-  }
-
-  window.mutateState = function(actionType, metadata) {
-    appState.meta = appState.meta || {};
-    appState.meta.deviceId = appState.meta.deviceId || getDeviceId();
-    appState.meta.lastLocalChangeAt = new Date().toISOString();
-    appState.meta.lastChangeBy = appState.meta.deviceId;
-    saveStateToLocalStorage();
-    idbPutAppState(buildPersistedStateSnapshot(appState)).catch(function() {});
-
-    if (actionType === 'SWITCH_USER' || actionType === 'SWITCH_LANGUAGE') {
-      updatePillSyncStatus();
-      updateSyncStatusBadge();
-      return;
-    }
-
-    queueMutation(actionType, metadata || {}, clone(appState)).then(function() {
-      updatePillSyncStatus();
-      updateSyncStatusBadge();
-      if (navigator.onLine) return window.flushOutbox();
-    }).catch(function(err) {
-      _syncLastFailed = true;
-      console.error('[SyncV3] Failed to queue mutation:', err);
-      updatePillSyncStatus();
-      updateSyncStatusBadge();
-    });
-  };
-
-  function applyCanonicalAndProject(snapshot) {
-    putCanonicalSnapshot(snapshot);
-    return idbGetOutboxOps().then(function(ops) {
-      ops = ops || [];
-      var projectedShared = Core.projectState(snapshot, ops);
-      var nextState = preserveLocalFields(projectedShared);
-      nextState.syncConflicts = ops.filter(function(op) {
-        return ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0;
-      }).map(function(op) { return op.lastResult || op; });
-      appState = nextState;
-      window.appState = appState;
-      normalizeAllItemImageFields();
-      saveStateToLocalStorage();
-      return idbPutAppState(buildPersistedStateSnapshot(appState)).then(function() {
-        syncUIComponents();
-        updatePillSyncStatus();
-        updateSyncStatusBadge();
-        updateLoginSyncStatus();
-      });
-    });
-  }
-
-  window.getCloudState = function() {
-    return postV3('SYNC_PULL', {
-      deviceId: getDeviceId(),
-      requestId: 'req_' + Date.now().toString(36),
-      includeDeleted: true
-    }).then(function(result) {
-      if (!result.initialized) return null;
-      return result.snapshot;
-    });
-  };
-
-  function clearBootstrapRepresentedOutbox() {
-    return idbGetOutboxOps().then(function(ops) {
-      return Promise.all((ops || []).map(function(op) { return idbDeleteOutboxOp(op.opId); }));
-    });
-  }
-
-  function bootstrapCloudRaw() {
-    return idbGetOutboxOps().then(function(ops) {
-      var snapshot = sharedSnapshotFromState(appState);
-      // appState already contains the local projection, so the snapshot includes
-      // all pending operations exactly once.
-      return postV3('SYNC_BOOTSTRAP', {
-        deviceId: getDeviceId(),
-        requestId: 'req_' + Date.now().toString(36),
-        expectedServerSeq: 0,
-        snapshot: snapshot
-      }).then(function(result) {
-        return clearBootstrapRepresentedOutbox().then(function() {
-          return applyCanonicalAndProject(result.snapshot);
-        });
-      });
-    });
-  }
-
   function processPushResults(submitted, result) {
-    var byId = {};
-    submitted.forEach(function(op) { byId[op.opId] = op; });
     var returned = {};
-    (result.results || []).forEach(function(opResult) { if (opResult && opResult.opId) returned[opResult.opId] = opResult; });
-
+    (result.results || []).forEach(function(item) { if (item && item.opId) returned[item.opId] = item; });
     return submitted.reduce(function(chain, op) {
       return chain.then(function() {
         var opResult = returned[op.opId];
         var action = Core.operationResultAction(opResult);
         if (action === 'delete') return idbDeleteOutboxOp(op.opId);
-        if (action === 'retry') return setOutboxStatus(op, 'retry', opResult || { errorCode: 'MISSING_OPERATION_RESULT' });
-        return setOutboxStatus(op, action, opResult);
+        return setOutboxStatus(op, action, opResult || { errorCode: 'MISSING_OPERATION_RESULT' });
       });
     }, Promise.resolve()).then(function() {
-      _syncConflict = Object.keys(returned).some(function(opId) {
-        return ['conflict', 'rejected', 'blocked'].indexOf(returned[opId].status) >= 0;
-      });
+      _syncConflict = (result.results || []).some(function(item) { return ['conflict', 'rejected', 'blocked'].indexOf(item.status) >= 0; });
+      if (!result.snapshot || result.snapshot.protocolVersion !== Core.PROTOCOL_VERSION) throw new Error('Server returned an invalid canonical snapshot.');
       return applyCanonicalAndProject(result.snapshot);
     });
   }
 
   function flushOutboxRaw() {
-    var endpoint = localStorage.getItem('sys_gas_url');
-    var secret = localStorage.getItem('sys_api_pwd');
-    if (!endpoint || !secret || !_syncV3CloudInitialized || _syncV3ProtocolError) return Promise.resolve();
-    if (_outboxFlushInProgress) return Promise.resolve();
+    var endpoint = currentEndpoint();
+    var token = localStorage.getItem('sys_api_pwd');
+    if (!endpoint || !token || !_cloudInitialized || _protocolError || _outboxFlushInProgress) return Promise.resolve();
     _outboxFlushInProgress = true;
     _syncLastFailed = false;
-    updatePillSyncStatus();
-    updateSyncStatusBadge();
-
-    var submitted = [];
-    return idbGetOutboxOps().then(function(ops) {
-      submitted = Core.sortOperations((ops || []).filter(function(op) {
-        return ['pending', 'retry'].indexOf(op.status || 'pending') >= 0;
-      }));
-      if (!submitted.length) return null;
-      submitted.forEach(function(op) { op.attemptedAt = new Date().toISOString(); });
-      return persistOperations(submitted).then(function() {
-        return postV3('SYNC_PUSH', {
-          deviceId: getDeviceId(),
-          requestId: 'req_' + Date.now().toString(36),
-          operations: submitted.map(function(op) {
-            var copy = clone(op);
-            delete copy.status;
-            delete copy.lastResult;
-            delete copy.updatedAt;
-            delete copy.attemptedAt;
-            return copy;
-          })
-        });
+    updatePillSyncStatus(); updateSyncStatusBadge();
+    var processed = {};
+    function drain() {
+      return ensureEndpointScope().then(function(ops) {
+        var batch = Core.selectPushBatch(ops, currentScope(), processed, MAX_PUSH_OPERATIONS);
+        if (!batch.length) return;
+        batch.forEach(function(op) { processed[op.opId] = true; op.attemptedAt = new Date().toISOString(); });
+        return Promise.all(batch.map(idbPutOutboxOp)).then(function() {
+          return requestV3('SYNC_PUSH', {
+            deviceId: getDeviceId(), requestId: 'req_' + Date.now().toString(36),
+            operations: batch.map(function(op) {
+              var copy = clone(op);
+              delete copy.status; delete copy.lastResult; delete copy.updatedAt; delete copy.attemptedAt; delete copy.syncEndpoint;
+              return copy;
+            })
+          });
+        }).then(function(result) { return processPushResults(batch, result); }).then(drain);
       });
-    }).then(function(result) {
-      if (!result) return;
-      return processPushResults(submitted, result);
-    }).catch(function(err) {
-      if (err.code === 'PROTOCOL_VERSION_MISMATCH') _syncV3ProtocolError = true;
+    }
+    return drain().catch(function(error) {
+      if (error.code === 'PROTOCOL_VERSION_MISMATCH') _protocolError = true;
       _syncLastFailed = true;
-      console.error('[SyncV3] Push failed:', err);
-      throw err;
+      console.error('[SyncV3] Push failed:', error);
+      throw error;
     }).finally(function() {
       _outboxFlushInProgress = false;
-      updatePillSyncStatus();
-      updateSyncStatusBadge();
-      updateLoginSyncStatus();
+      updatePillSyncStatus(); updateSyncStatusBadge(); updateLoginSyncStatus();
     });
   }
 
-  window.flushOutbox = function() {
-    if (_syncV3TaskDepth > 0) return flushOutboxRaw();
-    return enqueueSyncTask(flushOutboxRaw);
-  };
+  window.flushOutbox = function() { return _taskDepth > 0 ? flushOutboxRaw() : enqueueSyncTask(flushOutboxRaw); };
+
+  function clearCurrentEndpointOutbox() {
+    var scope = currentScope();
+    return idbGetOutboxOps().then(function(ops) {
+      return Promise.all((ops || []).filter(function(op) { return op.syncEndpoint === scope; }).map(function(op) { return idbDeleteOutboxOp(op.opId); }));
+    });
+  }
+
+  function bootstrapCloudRaw() {
+    return requestV3('SYNC_BOOTSTRAP', {
+      deviceId: getDeviceId(), requestId: 'req_' + Date.now().toString(36), expectedServerSeq: 0,
+      snapshot: sharedSnapshotFromState(appState)
+    }).then(function(result) {
+      return clearCurrentEndpointOutbox().then(function() { return applyCanonicalAndProject(result.snapshot); });
+    });
+  }
 
   function pullCloudRaw() {
-    var endpoint = localStorage.getItem('sys_gas_url');
+    var endpoint = currentEndpoint();
     if (!endpoint || _syncInProgress) return Promise.resolve();
     _syncInProgress = true;
     _syncLastFailed = false;
     _syncConflict = false;
-    showLoadingCloudOverlay();
-    updatePillSyncStatus();
-
-    return postV3('SYNC_PULL', {
-      deviceId: getDeviceId(),
-      requestId: 'req_' + Date.now().toString(36),
-      includeDeleted: true
+    showLoadingCloudOverlay(); updatePillSyncStatus();
+    var keptLocal = false;
+    return ensureEndpointScope().then(function() {
+      return requestV3('SYNC_PULL', { deviceId: getDeviceId(), requestId: 'req_' + Date.now().toString(36), includeDeleted: true });
     }).then(function(result) {
       if (!result.initialized) {
-        _syncV3CloudInitialized = false;
-        localStorage.removeItem(CLOUD_INITIALIZED_KEY);
+        _cloudInitialized = false;
         if (isSharedDataEmpty(appState)) {
           if (window.confirm('Cloud storage is empty. Initialize it for this household?')) return bootstrapCloudRaw();
           return;
         }
-        if (window.confirm('Cloud storage is empty. Upload this device\'s inventory to initialize multi-device sync?\n\nChoose Cancel to keep working locally.')) {
-          return bootstrapCloudRaw();
-        }
+        if (window.confirm('Cloud storage is empty. Upload this device\'s inventory to initialize multi-device sync?\n\nChoose Cancel to keep working locally.')) return bootstrapCloudRaw();
         showToast('Cloud not initialized. Changes remain saved locally.', 'info');
         return;
       }
-      _syncV3CloudInitialized = true;
-      localStorage.setItem(CLOUD_INITIALIZED_KEY, '1');
+      var canonical = getCanonicalSnapshot();
+      if (!canonical) {
+        var matches = localMatchesRemoteWithoutBaseline(result.snapshot);
+        if (!isSharedDataEmpty(appState) && !matches) {
+          var replace = window.confirm('This device contains local data but has no trusted synchronization baseline for this cloud.\n\nChoose OK to replace this device with the cloud copy. Choose Cancel to keep the local copy unchanged.');
+          if (!replace) {
+            keptLocal = true;
+            _cloudInitialized = false;
+            showOfflineBanner('Local data kept. Export or reconcile it before enabling this cloud.');
+            return;
+          }
+        }
+        return clearCurrentEndpointOutbox().then(function() {
+          _cloudInitialized = true;
+          return applyCanonicalAndProject(result.snapshot);
+        });
+      }
+      _cloudInitialized = true;
       return applyCanonicalAndProject(result.snapshot).then(flushOutboxRaw);
-    }).then(function() {
-      _syncLastFailed = false;
-      hideOfflineBanner();
-    }).catch(function(err) {
-      if (err.code === 'PROTOCOL_VERSION_MISMATCH') {
-        _syncV3ProtocolError = true;
+    }).then(function() { if (!keptLocal) hideOfflineBanner(); }).catch(function(error) {
+      if (error.code === 'PROTOCOL_VERSION_MISMATCH') {
+        _protocolError = true;
         showOfflineBanner('Cloud sync update required: protocol version mismatch.');
       } else {
         _syncLastFailed = true;
-        showOfflineBanner(err.message || 'Cannot reach cloud');
+        showOfflineBanner(error.message || 'Cannot reach cloud');
       }
-      console.error('[SyncV3] Boot sync failed:', err);
-      throw err;
+      console.error('[SyncV3] Pull failed:', error);
+      throw error;
     }).finally(function() {
       _syncInProgress = false;
-      hideLoadingCloudOverlay();
-      updatePillSyncStatus();
-      updateSyncStatusBadge();
-      updateLoginSyncStatus();
-      syncUIComponents();
+      hideLoadingCloudOverlay(); updatePillSyncStatus(); updateSyncStatusBadge(); updateLoginSyncStatus(); syncUIComponents();
     });
   }
 
-  window.bootSyncManager = function() {
-    return enqueueSyncTask(pullCloudRaw).catch(function() {});
+  window.bootSyncManager = function() { return enqueueSyncTask(pullCloudRaw).catch(function() {}); };
+  window.startupLoadFromCloud = window.bootSyncManager;
+  window.syncDataEngine = function(interactive) { return window.bootSyncManager().then(function() { if (interactive) showToast('Synchronization complete.', 'success'); }); };
+  window.syncNow = function(opts) { opts = opts || {}; if (opts.interactive !== false) showToast('Syncing...', 'info'); return window.bootSyncManager(); };
+  window.triggerSynchronousCloudFetchPull = window.bootSyncManager;
+  window.triggerAutoCloudSyncIfPossible = function() { setTimeout(window.bootSyncManager, 300); };
+  window.autoPullFromCloudIfPossible = window.bootSyncManager;
+  window.getCloudState = function() {
+    return requestV3('SYNC_PULL', { deviceId: getDeviceId(), requestId: 'req_' + Date.now().toString(36), includeDeleted: true })
+      .then(function(result) { return result.initialized ? result.snapshot : null; });
   };
 
-  window.startupLoadFromCloud = function() { return window.bootSyncManager(); };
-  window.syncDataEngine = function(interactive) {
-    return window.bootSyncManager().then(function() {
-      if (interactive) showToast('Synchronization complete.', 'success');
+  window.verifyCloudSync = function() {
+    return requestV3('SYNC_PULL', { deviceId: getDeviceId(), requestId: 'verify_' + Date.now().toString(36), includeDeleted: true }).then(function(result) {
+      if (!result.initialized) throw new Error('Cloud is not initialized.');
+      return idbGetOutboxOps().then(function(ops) {
+        var scoped = scopedOperations(ops);
+        if (!scoped.length && Core.stableStringify(comparableSnapshot(appState)) === Core.stableStringify(comparableSnapshot(result.snapshot))) showToast('✅ In sync — revision ' + result.serverSeq, 'success');
+        else showToast('⚠️ Sync review needed — ' + scoped.length + ' local operation(s) remain.', 'error');
+      });
+    }).catch(function(error) {
+      _syncLastFailed = true; updateSyncStatusBadge(); showToast('Sync verification failed: ' + error.message, 'error');
     });
   };
-  window.syncNow = function(opts) {
-    opts = opts || {};
-    if (opts.interactive !== false) showToast('Syncing...', 'info');
-    return window.bootSyncManager();
-  };
-  window.triggerSynchronousCloudFetchPull = function() {
-    return window.bootSyncManager();
-  };
-  window.triggerAutoCloudSyncIfPossible = function() {
-    setTimeout(function() { window.bootSyncManager(); }, 300);
-  };
-  window.autoPullFromCloudIfPossible = function() {
-    return window.bootSyncManager();
-  };
-  window.verifyCloudSync = function() {
-    return postV3('SYNC_PULL', { deviceId: getDeviceId(), requestId: 'verify_' + Date.now().toString(36), includeDeleted: true })
-      .then(function(result) {
-        if (!result.initialized) throw new Error('Cloud is not initialized.');
-        var localActive = (appState.inventory || []).filter(function(item) { return !item.deletedAt; }).length;
-        var remoteActive = (result.snapshot.inventory || []).filter(function(item) { return !item.deletedAt; }).length;
-        var pendingPromise = idbGetOutboxOps();
-        return pendingPromise.then(function(ops) {
-          if ((ops || []).length === 0 && localActive === remoteActive) {
-            showToast('✅ In sync — ' + localActive + ' items, revision ' + result.serverSeq, 'success');
-          } else {
-            showToast('⚠️ Sync review needed — ' + (ops || []).length + ' local operation(s) remain.', 'error');
-          }
-        });
-      }).catch(function(err) {
-        _syncLastFailed = true;
-        updateSyncStatusBadge();
-        showToast('Sync verification failed: ' + err.message, 'error');
-      });
-  };
+
+  function deleteOperationIds(ids) {
+    return ids.reduce(function(chain, id) { return chain.then(function() { return idbDeleteOutboxOp(id); }); }, Promise.resolve());
+  }
 
   function removeConflictPanel() {
-    if (_syncV3ConflictPanel && _syncV3ConflictPanel.parentNode) _syncV3ConflictPanel.parentNode.removeChild(_syncV3ConflictPanel);
-    _syncV3ConflictPanel = null;
+    if (_conflictPanel && _conflictPanel.parentNode) _conflictPanel.parentNode.removeChild(_conflictPanel);
+    _conflictPanel = null;
   }
 
-  function discardOperation(opId) {
-    return idbDeleteOutboxOp(opId).then(function() {
+  function discardOperationTree(rootId) {
+    return idbGetOutboxOps().then(function(ops) { return deleteOperationIds(Core.descendantIds(ops, rootId)); }).then(function() {
       removeConflictPanel();
-      return applyCanonicalAndProject(getCanonicalSnapshot() || sharedSnapshotFromState(appState));
+      var canonical = getCanonicalSnapshot();
+      if (canonical) return applyCanonicalAndProject(canonical);
     });
   }
 
-  function retryConflictKeepingLocal(op) {
-    var result = op.lastResult || {};
-    var actualVersion = Number(result.actualVersion || 0);
-    var replacement = null;
-    if (op.type === Core.OP_TYPES.ITEM_PUT && result.errorCode !== 'ENTITY_DELETED') {
-      replacement = Core.makeOperation({
-        type: op.type,
-        entityType: op.entityType,
-        entityId: op.entityId,
-        baseVersion: actualVersion,
-        deviceId: getDeviceId(),
-        payload: clone(op.payload)
+  function regenerateConflictTree(rootOperation) {
+    var canonical = getCanonicalSnapshot();
+    if (!canonical) return Promise.reject(new Error('No canonical cloud snapshot is available.'));
+    return idbGetOutboxOps().then(function(allOps) {
+      var scopeOps = scopedOperations(allOps);
+      var desired = Core.projectState(canonical, scopeOps);
+      var treeIds = Core.descendantIds(scopeOps, rootOperation.opId);
+      var treeMap = {};
+      treeIds.forEach(function(id) { treeMap[id] = true; });
+      var remaining = scopeOps.filter(function(op) { return !treeMap[op.opId]; });
+      var before = Core.projectState(canonical, remaining);
+      var generated = [];
+      var itemId = rootOperation.entityType === 'item' ? rootOperation.entityId : rootOperation.payload && rootOperation.payload.itemId;
+      var deviceId = getDeviceId();
+      if (itemId) {
+        var desiredItem = Core.findItem(desired, itemId);
+        generated = buildItemDiffOperations(desiredItem && desiredItem.deletedAt ? 'REMOVE_ITEM' : 'EDIT_ITEM', { itemId: itemId }, desired, remaining, before, deviceId);
+      } else if (rootOperation.type === Core.OP_TYPES.LOCATIONS_PUT) generated = [buildDocumentOperation(Core.OP_TYPES.LOCATIONS_PUT, desired, before, remaining, deviceId)];
+      else if (rootOperation.type === Core.OP_TYPES.CATEGORIES_PUT) generated = [buildDocumentOperation(Core.OP_TYPES.CATEGORIES_PUT, desired, before, remaining, deviceId)];
+      else if (rootOperation.type === Core.OP_TYPES.HOUSEHOLD_SETTINGS_PUT) generated = [buildDocumentOperation(Core.OP_TYPES.HOUSEHOLD_SETTINGS_PUT, desired, before, remaining, deviceId)];
+      generated.forEach(function(op) { op.syncEndpoint = currentScope(); });
+      if (!generated.length) throw new Error('This conflict cannot be reapplied automatically.');
+      return deleteOperationIds(treeIds).then(function() {
+        return generated.reduce(function(chain, op) { return chain.then(function() { return idbPutOutboxOp(op); }); }, Promise.resolve());
       });
-    } else if (op.type === Core.OP_TYPES.ITEM_DELETE && result.errorCode !== 'ENTITY_DELETED') {
-      replacement = Core.itemDelete(op.entityId, actualVersion, getDeviceId());
-    } else if (op.type === Core.OP_TYPES.STOCK_ENTRY_PUT && result.errorCode !== 'ENTITY_DELETED') {
-      replacement = Core.makeOperation({
-        type: op.type,
-        entityType: op.entityType,
-        entityId: op.entityId,
-        baseVersion: actualVersion,
-        deviceId: getDeviceId(),
-        payload: clone(op.payload)
-      });
-    } else if (op.type === Core.OP_TYPES.STOCK_ENTRY_DELETE && result.errorCode !== 'ENTITY_DELETED') {
-      replacement = Core.makeOperation({
-        type: op.type,
-        entityType: op.entityType,
-        entityId: op.entityId,
-        baseVersion: actualVersion,
-        deviceId: getDeviceId(),
-        payload: clone(op.payload)
-      });
-    } else if (op.type === Core.OP_TYPES.LOCATIONS_PUT) {
-      replacement = Core.locationsPut({
-        segments: op.payload.segments,
-        coordinates: op.payload.coordinates,
-        spatialBackgroundImage: op.payload.spatialBackgroundImage
-      }, actualVersion, getDeviceId());
-    } else if (op.type === Core.OP_TYPES.CATEGORIES_PUT) {
-      replacement = Core.categoriesPut({ categories: op.payload.categories }, actualVersion, getDeviceId());
-    } else if (op.type === Core.OP_TYPES.HOUSEHOLD_SETTINGS_PUT) {
-      replacement = Core.householdSettingsPut({
-        users: op.payload.users,
-        userEmails: op.payload.userEmails,
-        reminderDays: op.payload.reminderDays
-      }, actualVersion, getDeviceId());
-    }
-    if (!replacement) {
-      showToast('This conflict cannot be automatically reapplied. Review the details and create a new item/change manually.', 'error');
-      return Promise.resolve();
-    }
-    return idbDeleteOutboxOp(op.opId).then(function() {
-      return idbPutOutboxOp(replacement);
     }).then(function() {
       removeConflictPanel();
-      return flushOutboxRaw();
+      return applyCanonicalAndProject(canonical).then(flushOutboxRaw);
     });
   }
 
-  function showConflictDetails(op) {
-    var result = op.lastResult || {};
-    var detail = {
-      operation: { type: op.type, entityId: op.entityId, baseVersion: op.baseVersion, payload: op.payload },
-      serverResult: result
-    };
-    window.alert(JSON.stringify(detail, null, 2));
+  function showConflictDetails(op, isOrphaned) {
+    window.alert(JSON.stringify({
+      operation: { type: op.type, entityId: op.entityId, baseVersion: op.baseVersion, dependsOnOpId: op.dependsOnOpId, syncEndpoint: op.syncEndpoint, payload: op.payload },
+      status: isOrphaned ? 'orphaned_endpoint' : op.status,
+      serverResult: op.lastResult || null
+    }, null, 2));
+  }
+
+  function makeButton(text, background, color) {
+    var button = document.createElement('button');
+    button.textContent = text;
+    button.style.cssText = 'padding:6px 10px;border-radius:7px;border:1px solid #cbd5e1;background:' + background + ';color:' + color + ';font-size:12px';
+    return button;
   }
 
   function openConflictPanel() {
     idbGetOutboxOps().then(function(ops) {
-      var problems = (ops || []).filter(function(op) {
-        return ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0;
-      });
+      var current = currentScope();
+      var problems = (ops || []).filter(function(op) { return op.syncEndpoint !== current || ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0; });
       if (!problems.length) return;
       removeConflictPanel();
       var overlay = document.createElement('div');
       overlay.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(15,23,42,.65);display:flex;align-items:center;justify-content:center;padding:16px';
       var panel = document.createElement('div');
       panel.style.cssText = 'background:white;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-width:760px;width:100%;max-height:85vh;overflow:auto;padding:20px';
-      panel.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h2 style="font-size:18px;font-weight:700">Synchronization problems</h2><button data-close style="font-size:22px">×</button></div>';
+      var header = document.createElement('div');
+      header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:14px';
+      var title = document.createElement('h2');
+      title.textContent = 'Synchronization problems'; title.style.cssText = 'font-size:18px;font-weight:700';
+      var close = makeButton('×', 'white', '#475569'); close.onclick = removeConflictPanel;
+      header.appendChild(title); header.appendChild(close); panel.appendChild(header);
       problems.forEach(function(op) {
+        var isOrphaned = op.syncEndpoint !== current;
         var result = op.lastResult || {};
-        var row = document.createElement('div');
-        row.style.cssText = 'border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px';
-        var keepAllowed = op.status === 'conflict' && result.errorCode !== 'ENTITY_DELETED';
-        row.innerHTML = '<div style="font-weight:700;font-size:13px">' + String(op.type) + ' — ' + String(op.entityId) + '</div>' +
-          '<div style="font-size:12px;color:#64748b;margin:4px 0 10px">' + String(result.errorCode || op.status) + '</div>' +
-          '<div style="display:flex;gap:8px;flex-wrap:wrap"><button data-discard style="padding:6px 10px;border-radius:7px;background:#e2e8f0">Use cloud / discard local</button>' +
-          (keepAllowed ? '<button data-keep style="padding:6px 10px;border-radius:7px;background:#2563eb;color:white">Keep my version</button>' : '') +
-          '<button data-detail style="padding:6px 10px;border-radius:7px;background:#f8fafc;border:1px solid #cbd5e1">Review details</button></div>';
-        row.querySelector('[data-discard]').onclick = function() { discardOperation(op.opId); };
-        if (keepAllowed) row.querySelector('[data-keep]').onclick = function() { retryConflictKeepingLocal(op); };
-        row.querySelector('[data-detail]').onclick = function() { showConflictDetails(op); };
-        panel.appendChild(row);
+        var row = document.createElement('div'); row.style.cssText = 'border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px';
+        var name = document.createElement('div'); name.textContent = String(op.type || 'Operation') + ' — ' + String(op.entityId || ''); name.style.cssText = 'font-weight:700;font-size:13px';
+        var reason = document.createElement('div'); reason.textContent = isOrphaned ? 'Saved for a different cloud endpoint' : String(result.errorCode || op.status || 'problem'); reason.style.cssText = 'font-size:12px;color:#64748b;margin:4px 0 10px';
+        var actions = document.createElement('div'); actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+        var discard = makeButton(isOrphaned ? 'Discard operation' : 'Use cloud / discard local tree', '#e2e8f0', '#334155'); discard.onclick = function() { discardOperationTree(op.opId); }; actions.appendChild(discard);
+        if (!isOrphaned && op.status === 'conflict' && result.errorCode !== 'ENTITY_DELETED') {
+          var keep = makeButton('Keep my latest version', '#2563eb', 'white');
+          keep.onclick = function() { regenerateConflictTree(op).catch(function(error) { showToast(error.message, 'error'); }); };
+          actions.appendChild(keep);
+        }
+        var detail = makeButton('Review details', '#f8fafc', '#334155'); detail.onclick = function() { showConflictDetails(op, isOrphaned); }; actions.appendChild(detail);
+        row.appendChild(name); row.appendChild(reason); row.appendChild(actions); panel.appendChild(row);
       });
       overlay.appendChild(panel);
       overlay.onclick = function(event) { if (event.target === overlay) removeConflictPanel(); };
-      panel.querySelector('[data-close]').onclick = removeConflictPanel;
-      document.body.appendChild(overlay);
-      _syncV3ConflictPanel = overlay;
+      document.body.appendChild(overlay); _conflictPanel = overlay;
     });
   }
 
-  var oldUpdatePill = window.updatePillSyncStatus;
+  var legacyUpdatePill = window.updatePillSyncStatus;
   window.updatePillSyncStatus = function() {
-    if (_syncV3ProtocolError) {
+    if (_protocolError) {
       ['syncStatusPill', 'syncStatusPillMobile'].forEach(function(id) {
         var pill = document.getElementById(id);
-        if (pill) {
-          pill.className = 'sync-pill pill-conflict';
-          pill.innerText = 'Update required';
-        }
+        if (pill) { pill.className = 'sync-pill pill-conflict'; pill.textContent = 'Update required'; }
       });
       return;
     }
-    var result = oldUpdatePill.apply(this, arguments);
+    var result = legacyUpdatePill ? legacyUpdatePill.apply(this, arguments) : undefined;
     setTimeout(function() {
       idbGetOutboxOps().then(function(ops) {
-        var hasProblems = (ops || []).some(function(op) {
-          return ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0;
-        });
-        if (!hasProblems) return;
+        var current = currentScope();
+        var problems = (ops || []).filter(function(op) { return op.syncEndpoint !== current || ['conflict', 'rejected', 'blocked'].indexOf(op.status) >= 0; });
+        var pending = (ops || []).filter(function(op) { return op.syncEndpoint === current && ['pending', 'retry'].indexOf(op.status || 'pending') >= 0; });
         ['syncStatusPill', 'syncStatusPillMobile'].forEach(function(id) {
           var pill = document.getElementById(id);
           if (!pill) return;
-          pill.className = 'sync-pill pill-conflict';
-          pill.innerText = '⚠ Needs review';
-          pill.onclick = openConflictPanel;
+          if (problems.length) { pill.className = 'sync-pill pill-conflict'; pill.textContent = '⚠ Needs review'; pill.onclick = openConflictPanel; }
+          else if (pending.length) { pill.className = 'sync-pill pill-pending'; pill.textContent = pending.length + ' changes waiting'; pill.onclick = window.bootSyncManager; }
+          else if (!_syncInProgress && !_outboxFlushInProgress && !_syncLastFailed && _lastSuccessfulEndpoint === currentEndpoint()) { pill.className = 'sync-pill pill-synced'; pill.textContent = '✔ Synced'; pill.onclick = window.bootSyncManager; }
         });
-      });
+      }).catch(function() {});
     }, 0);
     return result;
   };
