@@ -2,11 +2,10 @@
  * Find My Item service worker.
  *
  * The legacy UI remains in app.js. For controlled pages, the service worker
- * returns a deterministic concatenation of app.js, sync-v3-core.js, and
- * sync-v3.js so protocol v3 overrides are installed synchronously before
- * DOMContentLoaded without document.write or asynchronous script races.
+ * returns a deterministic concatenation of app.js and the protocol-v3 modules
+ * so overrides are installed synchronously before DOMContentLoaded.
  */
-const CACHE_VERSION = 'v5-sync3-review';
+const CACHE_VERSION = 'v6-sync3-review2';
 const APP_SHELL_CACHE = 'fmi-shell-' + CACHE_VERSION;
 const STATIC_CACHE = 'fmi-static-' + CACHE_VERSION;
 const CDN_CACHE = 'fmi-cdn-' + CACHE_VERSION;
@@ -18,6 +17,7 @@ const APP_SHELL = [
   './app.js',
   './sync-v3-core.js',
   './sync-v3.js',
+  './sync-v3-import-adapter.js',
   './manifest.json'
 ];
 
@@ -87,11 +87,13 @@ function bundledAppResponse() {
   return Promise.all([
     getScriptText('./app.js'),
     getScriptText('./sync-v3-core.js'),
-    getScriptText('./sync-v3.js')
+    getScriptText('./sync-v3.js'),
+    getScriptText('./sync-v3-import-adapter.js')
   ]).then(function(parts) {
     var source = parts[0] +
       '\n;/* bundled sync-v3-core.js */\n' + parts[1] +
-      '\n;/* bundled sync-v3.js */\n' + parts[2] + '\n';
+      '\n;/* bundled sync-v3.js */\n' + parts[2] +
+      '\n;/* bundled sync-v3-import-adapter.js */\n' + parts[3] + '\n';
     return new Response(source, {
       status: 200,
       headers: {
