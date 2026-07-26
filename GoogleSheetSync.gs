@@ -11,6 +11,7 @@ var CONFIG = {
   maxCellSize: 40000,
   maxOperations: 100,
   maxRequestChars: 500000,
+  maxImageRequestChars: 8000000,
   maxTextLength: 10000,
   secretProperty: 'SYNC_SECRET_TOKEN'
 };
@@ -54,7 +55,9 @@ function parseRequest(e) {
   e = e || {};
   var p = e.parameter || {};
   var rawBody = e.postData && e.postData.contents ? String(e.postData.contents) : '';
-  if (rawBody.length > CONFIG.maxRequestChars) throw new Error('PAYLOAD_TOO_LARGE');
+  var hintedAction = String(p.action || '');
+  var requestLimit = hintedAction === 'IMAGE_UPLOAD' ? CONFIG.maxImageRequestChars : CONFIG.maxRequestChars;
+  if (rawBody.length > requestLimit) throw new Error('PAYLOAD_TOO_LARGE');
   var body = {};
   if (rawBody && /^\s*\{/.test(rawBody)) {
     try { body = JSON.parse(rawBody); } catch (ignore) {}
@@ -135,8 +138,13 @@ function writeMeta(meta) {
     ['activeChecksum', meta.activeChecksum || ''],
     ['activeChunkCount', String(meta.activeChunkCount || 0)]
   ];
-  if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).clearContent();
+  var previousLastRow = sheet.getLastRow();
+  // Write the replacement pointer first. If setValues fails, the previous
+  // active snapshot metadata remains readable instead of being cleared.
   sheet.getRange(2, 1, rows.length, 2).setValues(rows);
+  if (previousLastRow > rows.length + 1) {
+    sheet.getRange(rows.length + 2, 1, previousLastRow - rows.length - 1, 2).clearContent();
+  }
 }
 
 function checksum(text) {
@@ -181,6 +189,22 @@ function normalizeSnapshot(input, serverSeq) {
   state.meta.locationsVersion = Math.max(0, Number(state.meta.locationsVersion || state.meta.structureVersion || 0));
   state.meta.categoriesVersion = Math.max(0, Number(state.meta.categoriesVersion || state.meta.categoryVersion || 0));
   state.meta.householdSettingsVersion = Math.max(0, Number(state.meta.householdSettingsVersion || 0));
+
+  // Exact committed-operation hashes are part of the canonical snapshot.
+  // Server sequence numbers can be reused after a failed pre-commit attempt,
+  // so sequence comparison alone cannot prove that a receipt was committed.
+  var rawCommittedHashes = state.meta.committedOperationHashes;
+  var committedHashes = {};
+  if (rawCommittedHashes && typeof rawCommittedHashes === 'object' && !Array.isArray(rawCommittedHashes)) {
+    Object.keys(rawCommittedHashes).forEach(function(opId) {
+      var hash = rawCommittedHashes[opId];
+      if (opId && opId.length <= 300 && typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) {
+        committedHashes[opId] = hash;
+      }
+    });
+  }
+  state.meta.committedOperationHashes = committedHashes;
+
   delete state.meta.deviceId;
   delete state.meta.lastLocalChangeAt;
   delete state.meta.lastChangeBy;
@@ -242,6 +266,12 @@ function loadCanonical(meta) {
   return normalizeSnapshot(readSlot(meta.activeSlot, meta.activeChunkCount, meta.activeChecksum), meta.serverSeq);
 }
 
+function clientSnapshot(state) {
+  var copy = JSON.parse(JSON.stringify(state || {}));
+  if (copy.meta) delete copy.meta.committedOperationHashes;
+  return copy;
+}
+
 function writeCanonicalAtomically(state, meta) {
   var inactive = meta.activeSlot === 'A' ? 'B' : 'A';
   state = normalizeSnapshot(state, meta.serverSeq);
@@ -282,7 +312,7 @@ function withSyncLock(fn) {
 function handleSyncPull() {
   var meta = readMeta();
   if (!meta.initialized) return { success: true, initialized: false, serverSeq: 0, snapshot: null };
-  return { success: true, initialized: true, serverSeq: meta.serverSeq, snapshot: loadCanonical(meta) };
+  return { success: true, initialized: true, serverSeq: meta.serverSeq, snapshot: clientSnapshot(loadCanonical(meta)) };
 }
 
 function handleSyncBootstrap(payload) {
@@ -293,10 +323,12 @@ function handleSyncBootstrap(payload) {
       return fail('SERVER_ALREADY_INITIALIZED', 'Cloud data has already been initialized.', false);
     }
     var state = normalizeSnapshot(payload.snapshot || {}, 0);
+    // A client must never be able to predeclare operation IDs as committed.
+    state.meta.committedOperationHashes = {};
     meta.serverSeq = 0;
     state = writeCanonicalAtomically(state, meta);
     writeAudit(payload.deviceId || '', 'SYNC_BOOTSTRAP', 0, true, '');
-    return { success: true, initialized: true, serverSeq: 0, snapshot: state };
+    return { success: true, initialized: true, serverSeq: 0, snapshot: clientSnapshot(state) };
   });
 }
 
@@ -387,28 +419,32 @@ function storedResult(op, existing, statusOverride) {
 }
 
 /**
- * Returns a prior conclusive result, or null when an "applied" receipt belongs
- * to a failed pre-commit attempt and the operation must be applied again.
+ * A receipt is conclusive only when the canonical snapshot contains the exact
+ * immutable operation hash. Sequence comparison is insufficient because an
+ * uncommitted sequence can later be reused by a different successful batch.
  */
-function resolveExistingOperation(op, hash, existing, committedServerSeq) {
+function resolveExistingOperation(op, hash, existing, committedOperationHashes) {
+  var committedHash = committedOperationHashes && committedOperationHashes[op.opId];
+  if (committedHash) {
+    if (committedHash !== hash) return resultFor(op, 'rejected', { errorCode: 'OP_ID_REUSE' });
+    return existing ? storedResult(op, existing, 'duplicate') : resultFor(op, 'duplicate');
+  }
   if (!existing) return null;
   if (existing.operationHash !== hash) return resultFor(op, 'rejected', { errorCode: 'OP_ID_REUSE' });
   if (existing.status === 'applied') {
-    if (existing.serverSeq > 0 && existing.serverSeq <= committedServerSeq) {
-      return storedResult(op, existing, 'duplicate');
-    }
+    // Prepared receipt whose state was not committed: reapply from the current
+    // canonical snapshot. A later successful batch cannot make it look committed.
     return null;
   }
   return storedResult(op, existing, existing.status || 'rejected');
 }
 
-function dependencySucceeded(opId, batchResults, operationIndex, committedServerSeq) {
+function dependencySucceeded(opId, batchResults, committedOperationHashes) {
   if (!opId) return true;
   if (batchResults[opId]) {
     return ['applied', 'duplicate'].indexOf(batchResults[opId].status) >= 0;
   }
-  var existing = operationIndex[opId];
-  return !!existing && existing.status === 'applied' && existing.serverSeq > 0 && existing.serverSeq <= committedServerSeq;
+  return !!(committedOperationHashes && committedOperationHashes[opId]);
 }
 
 function validateTextLengths(value) {
@@ -663,7 +699,7 @@ function handleSyncPush(payload) {
     var meta = readMeta();
     if (!meta.initialized) return fail('SERVER_NOT_INITIALIZED', 'Cloud storage must be initialized first.', false);
     var state = loadCanonical(meta);
-    var committedServerSeq = meta.serverSeq;
+    var committedOperationHashes = state.meta.committedOperationHashes || {};
     var operationIndex = loadOperationIndex();
     var batchResults = {};
     var results = [];
@@ -678,8 +714,8 @@ function handleSyncPush(payload) {
       if (validation) {
         result = resultFor(op, 'rejected', { errorCode: validation });
       } else {
-        result = resolveExistingOperation(op, hash, operationIndex[op.opId], committedServerSeq);
-        if (!result && op.dependsOnOpId && !dependencySucceeded(op.dependsOnOpId, batchResults, operationIndex, committedServerSeq)) {
+        result = resolveExistingOperation(op, hash, operationIndex[op.opId], committedOperationHashes);
+        if (!result && op.dependsOnOpId && !dependencySucceeded(op.dependsOnOpId, batchResults, committedOperationHashes)) {
           result = resultFor(op, 'blocked', { errorCode: 'DEPENDENCY_FAILED' });
         }
         if (!result) {
@@ -688,11 +724,12 @@ function handleSyncPush(payload) {
             meta.serverSeq += 1;
             state.meta.serverSeq = meta.serverSeq;
             result.serverSeq = meta.serverSeq;
+            committedOperationHashes[op.opId] = hash;
+            state.meta.committedOperationHashes = committedOperationHashes;
             appliedCount += 1;
           }
-          // Receipt is intentionally written before the snapshot. If the later
-          // atomic snapshot commit fails, resolveExistingOperation detects that
-          // result.serverSeq is newer than committedServerSeq and reapplies it.
+          // The receipt is written before the snapshot for diagnostics. Only
+          // the exact hash set inside the canonical snapshot proves commitment.
           appendOperation(op, hash, result);
           operationIndex[op.opId] = Object.assign({ operationHash: hash }, result);
         }
@@ -707,7 +744,7 @@ function handleSyncPush(payload) {
 
     if (appliedCount > 0) state = writeCanonicalAtomically(state, meta);
     writeAudit(payload.deviceId || '', 'SYNC_PUSH', operations.length, true, '');
-    return { success: true, serverSeq: meta.serverSeq, results: results, snapshot: state };
+    return { success: true, serverSeq: meta.serverSeq, results: results, snapshot: clientSnapshot(state) };
   });
 }
 
@@ -741,7 +778,9 @@ function migrateLegacyDataToV3() {
       backup.getRange(1, 1, range.getNumRows(), range.getNumColumns()).setValues(range.getValues());
     }
     meta.serverSeq = Number(state.meta && state.meta.lastServerRevision || 0);
-    state = writeCanonicalAtomically(normalizeSnapshot(state, meta.serverSeq), meta);
+    state = normalizeSnapshot(state, meta.serverSeq);
+    state.meta.committedOperationHashes = {};
+    state = writeCanonicalAtomically(state, meta);
     Logger.log('Migration complete: ' + state.inventory.length + ' items, serverSeq=' + meta.serverSeq);
     return state;
   });
@@ -790,7 +829,7 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-function handleSendReminders(req) {
+function sendRemindersUnlocked(req) {
   var groups = req.payload && req.payload.groups ? req.payload.groups : req.payload;
   if (!Array.isArray(groups)) return fail('INVALID_REQUEST', 'Reminder payload must be an array.', false);
   var known = loadReminderKeys();
@@ -809,6 +848,10 @@ function handleSendReminders(req) {
     sent += 1;
   });
   return { success: true, sent: sent, recipients: sent };
+}
+
+function handleSendReminders(req) {
+  return withSyncLock(function() { return sendRemindersUnlocked(req); });
 }
 
 function daysUntil(dateValue) {
@@ -861,10 +904,12 @@ function buildScheduledReminderGroups(state) {
 }
 
 function checkAndRemind() {
-  var meta = readMeta();
-  if (!meta.initialized) return { success: true, sent: 0, recipients: 0 };
-  var state = loadCanonical(meta);
-  return handleSendReminders({ payload: buildScheduledReminderGroups(state) });
+  return withSyncLock(function() {
+    var meta = readMeta();
+    if (!meta.initialized) return { success: true, sent: 0, recipients: 0 };
+    var state = loadCanonical(meta);
+    return sendRemindersUnlocked({ payload: buildScheduledReminderGroups(state) });
+  });
 }
 
 function setupTimeTrigger() {

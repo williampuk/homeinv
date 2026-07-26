@@ -90,26 +90,43 @@ test('stock deltas compose and negative stock is rejected', function() {
   assert.equal(s.inventory[0].quantity, 13);
 });
 
-test('committed applied receipts become duplicates', function() {
+test('canonical operation hash makes an applied receipt a duplicate', function() {
   const operation = op({ type: 'ITEM_DELETE', baseVersion: 4 });
   const hash = context.opHash(operation);
   const existing = { operationHash: hash, status: 'applied', serverSeq: 8, entityVersion: 5 };
-  const result = context.resolveExistingOperation(operation, hash, existing, 8);
+  const committed = { [operation.opId]: hash };
+  const result = context.resolveExistingOperation(operation, hash, existing, committed);
   assert.equal(result.status, 'duplicate');
 });
 
-test('uncommitted applied receipts are reapplied after failed snapshot commit', function() {
+test('canonical operation hash works even when the audit receipt is missing', function() {
+  const operation = op({ type: 'ITEM_DELETE', baseVersion: 4 });
+  const hash = context.opHash(operation);
+  const result = context.resolveExistingOperation(operation, hash, null, { [operation.opId]: hash });
+  assert.equal(result.status, 'duplicate');
+});
+
+test('failed receipt stays uncommitted after another batch reuses its server sequence', function() {
   const operation = op({ type: 'ITEM_DELETE', baseVersion: 4 });
   const hash = context.opHash(operation);
   const existing = { operationHash: hash, status: 'applied', serverSeq: 8, entityVersion: 5 };
-  assert.equal(context.resolveExistingOperation(operation, hash, existing, 7), null);
+  // Another operation may later commit serverSeq 8. Exact canonical membership,
+  // not the numeric sequence, determines whether this operation was committed.
+  const committed = { 'different-op': context.opHash(op({ opId: 'different-op', type: 'ITEM_DELETE', baseVersion: 4 })) };
+  assert.equal(context.resolveExistingOperation(operation, hash, existing, committed), null);
+});
+
+test('dependencies trust only current-batch success or exact canonical membership', function() {
+  assert.equal(context.dependencySucceeded('parent', {}, { parent: 'hash' }), true);
+  assert.equal(context.dependencySucceeded('parent', {}, { other: 'hash' }), false);
+  assert.equal(context.dependencySucceeded('parent', { parent: { status: 'applied' } }, {}), true);
 });
 
 test('conflict receipts remain conflicts rather than false duplicates', function() {
   const operation = op({ type: 'ITEM_PUT', baseVersion: 3, payload: { item: { id: 'item-1' } } });
   const hash = context.opHash(operation);
   const existing = { operationHash: hash, status: 'conflict', errorCode: 'VERSION_CONFLICT', actualVersion: 4 };
-  const result = context.resolveExistingOperation(operation, hash, existing, 99);
+  const result = context.resolveExistingOperation(operation, hash, existing, {});
   assert.equal(result.status, 'conflict');
   assert.equal(result.errorCode, 'VERSION_CONFLICT');
 });

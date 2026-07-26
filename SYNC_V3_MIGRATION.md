@@ -47,7 +47,7 @@ Do not manually edit `Meta`, `Data_A`, `Data_B`, or `Ops` while clients are sync
 
 ### Receipt recovery
 
-An operation receipt may be written immediately before the active snapshot slot is switched. The server trusts an `applied` receipt only when its sequence is present in the committed snapshot. A newer receipt is treated as prepared but uncommitted, so the immutable operation is reapplied on retry. This protects stock deltas when a request fails during the final commit.
+An operation receipt may be written immediately before the active snapshot slot is switched. Numeric server sequences are not sufficient proof of commitment because a failed sequence can later be reused by another batch. The canonical snapshot therefore stores the exact immutable `opId → operation hash` set that it contains. A receipt absent from that set is prepared but uncommitted and is reapplied on retry; an operation present in the set is a duplicate even if its audit receipt is missing. This protects stock deltas across both sides of the final-commit failure window.
 
 ## 3. Web deployment and first load
 
