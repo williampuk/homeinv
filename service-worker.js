@@ -5,15 +5,19 @@
  * returns a deterministic concatenation of app.js and the protocol-v3 modules
  * so overrides are installed synchronously before DOMContentLoaded.
  */
-const CACHE_VERSION = 'v7-sync3-review2';
+const CACHE_VERSION = 'v8-sync3-review4';
 const APP_SHELL_CACHE = 'fmi-shell-' + CACHE_VERSION;
 const STATIC_CACHE = 'fmi-static-' + CACHE_VERSION;
 const CDN_CACHE = 'fmi-cdn-' + CACHE_VERSION;
 
 const APP_SHELL = [
   './', './index.html', './style.css', './app.js', './sync-v3-core.js', './sync-v3.js',
-  './sync-v3-import-adapter.js', './sync-v3-endpoint-guard.js', './manifest.json'
+  './sync-v3-import-adapter.js', './sync-v3-endpoint-guard.js', './sync-v3-mutation-guard.js',
+  './manifest.json'
 ];
+const APP_SHELL_PATHS = APP_SHELL.map(function(path) {
+  return new URL(path, self.location.href).pathname;
+});
 
 const CDN_URLS = [
   'https://cdn.tailwindcss.com',
@@ -71,13 +75,15 @@ function bundledAppResponse() {
     getScriptText('./sync-v3-core.js'),
     getScriptText('./sync-v3.js'),
     getScriptText('./sync-v3-import-adapter.js'),
-    getScriptText('./sync-v3-endpoint-guard.js')
+    getScriptText('./sync-v3-endpoint-guard.js'),
+    getScriptText('./sync-v3-mutation-guard.js')
   ]).then(function(parts) {
     var source = parts[0] +
       '\n;/* bundled sync-v3-core.js */\n' + parts[1] +
       '\n;/* bundled sync-v3.js */\n' + parts[2] +
       '\n;/* bundled sync-v3-import-adapter.js */\n' + parts[3] +
-      '\n;/* bundled sync-v3-endpoint-guard.js */\n' + parts[4] + '\n';
+      '\n;/* bundled sync-v3-endpoint-guard.js */\n' + parts[4] +
+      '\n;/* bundled sync-v3-mutation-guard.js */\n' + parts[5] + '\n';
     return new Response(source, {
       status: 200,
       headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }
@@ -88,6 +94,10 @@ function bundledAppResponse() {
       headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
     });
   });
+}
+
+function isAppShellRequest(url) {
+  return url.origin === self.location.origin && APP_SHELL_PATHS.indexOf(url.pathname) >= 0;
 }
 
 self.addEventListener('fetch', function(event) {
@@ -125,7 +135,7 @@ self.addEventListener('fetch', function(event) {
     return;
   }
 
-  if (APP_SHELL.some(function(path) { return url.pathname.endsWith(path.replace('./', '')); })) {
+  if (isAppShellRequest(url)) {
     event.respondWith(caches.match(event.request).then(function(cached) {
       return cached || networkThenCache(event.request, APP_SHELL_CACHE);
     }));
