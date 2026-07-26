@@ -8,41 +8,13 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply-review-fix:
-    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'agent/multi-device-sync-v3' && github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: agent/multi-device-sync-v3
-          fetch-depth: 0
-      - name: Apply exact commit recovery patch
-        run: |
-          sed -i 's/read_text(encoding="utf-8")n$/read_text(encoding="utf-8")/' scripts/apply-review4-sync-fix.py
-          python3 scripts/apply-review4-sync-fix.py
-      - name: Commit reviewed patch when needed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add GoogleSheetSync.gs tests/google-sheet-sync-v3.test.js SYNC_V3_MIGRATION.md
-          if git diff --cached --quiet; then
-            echo "No patch changes to commit."
-            exit 0
-          fi
-          git commit -m "Harden exact sync commit recovery"
-          git push origin HEAD:agent/multi-device-sync-v3
-
   test:
-    needs: apply-review-fix
-    if: ${{ always() && (needs.apply-review-fix.result == 'success' || needs.apply-review-fix.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
