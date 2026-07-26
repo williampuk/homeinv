@@ -25,6 +25,22 @@
     return JSON.parse(JSON.stringify(value));
   }
 
+  function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === 'object') {
+      var result = {};
+      Object.keys(value).sort().forEach(function(key) {
+        result[key] = stableValue(value[key]);
+      });
+      return result;
+    }
+    return value;
+  }
+
+  function stableStringify(value) {
+    return JSON.stringify(stableValue(value));
+  }
+
   function activeEntries(item) {
     return ((item && item.stockEntries) || []).filter(function(entry) {
       return entry && !entry.hiddenAt;
@@ -129,10 +145,7 @@
   }
 
   function stockEntryPut(itemId, entry, baseVersion, initialQuantity, deviceId, dependency) {
-    var payload = {
-      itemId: itemId,
-      entry: stripEntryServerFields(entry)
-    };
+    var payload = { itemId: itemId, entry: stripEntryServerFields(entry) };
     if (Number(baseVersion || 0) === 0) payload.initialQuantity = Number(initialQuantity || 0);
     return makeOperation({
       type: OP_TYPES.STOCK_ENTRY_PUT,
@@ -233,11 +246,7 @@
 
     function visit(op) {
       if (!op || !op.opId || visited[op.opId]) return;
-      if (visiting[op.opId]) {
-        // A dependency cycle is invalid. Preserve deterministic order and let the
-        // server reject/block it instead of recursing forever.
-        return;
-      }
+      if (visiting[op.opId]) return;
       visiting[op.opId] = true;
       if (op.dependsOnOpId && byId[op.dependsOnOpId]) visit(byId[op.dependsOnOpId]);
       visiting[op.opId] = false;
@@ -249,8 +258,14 @@
     return output;
   }
 
+  function bumpVersion(entity, minimum) {
+    if (!entity) return;
+    entity.version = Math.max(Number(entity.version || 0) + 1, Number(minimum || 0));
+  }
+
   function applyProjectedOperation(state, op) {
     state = state || {};
+    state.meta = state.meta || {};
     state.inventory = state.inventory || [];
     var item;
     var entry;
@@ -263,7 +278,7 @@
         if (index < 0) {
           item = Object.assign({}, clone(payload.item || {}), {
             id: op.entityId,
-            version: Math.max(1, Number(op.baseVersion || 0) + 1),
+            version: 1,
             stockEntries: [],
             deletedAt: null
           });
@@ -273,7 +288,7 @@
           var preservedEntries = clone(item.stockEntries || []);
           state.inventory[index] = Object.assign({}, item, clone(payload.item || {}), {
             id: op.entityId,
-            version: Math.max(Number(item.version || 0), Number(op.baseVersion || 0) + 1),
+            version: Math.max(Number(item.version || 0) + 1, Number(op.baseVersion || 0) + 1),
             stockEntries: preservedEntries,
             deletedAt: item.deletedAt || null
           });
@@ -281,7 +296,10 @@
         break;
       case OP_TYPES.ITEM_DELETE:
         item = findItem(state, op.entityId);
-        if (item) item.deletedAt = item.deletedAt || op.createdAt;
+        if (item) {
+          item.deletedAt = item.deletedAt || op.createdAt;
+          bumpVersion(item, Number(op.baseVersion || 0) + 1);
+        }
         break;
       case OP_TYPES.STOCK_ENTRY_PUT:
         item = findItem(state, payload.itemId);
@@ -301,45 +319,65 @@
           item.stockEntries[index] = Object.assign({}, entry, clone(payload.entry || {}), {
             id: op.entityId,
             quantity: Number(entry.quantity || 0),
-            version: Math.max(Number(entry.version || 0), Number(op.baseVersion || 0) + 1),
+            version: Math.max(Number(entry.version || 0) + 1, Number(op.baseVersion || 0) + 1),
             hiddenAt: null
           });
         }
+        bumpVersion(item);
         item.quantity = stockTotal(item);
         break;
       case OP_TYPES.STOCK_ENTRY_DELETE:
         item = findItem(state, payload.itemId);
         entry = findEntry(item, payload.entryId);
-        if (entry) entry.hiddenAt = entry.hiddenAt || op.createdAt;
-        if (item) item.quantity = stockTotal(item);
+        if (entry) {
+          entry.hiddenAt = entry.hiddenAt || op.createdAt;
+          bumpVersion(entry, Number(op.baseVersion || 0) + 1);
+        }
+        if (item) {
+          bumpVersion(item);
+          item.quantity = stockTotal(item);
+        }
         break;
       case OP_TYPES.STOCK_ADJUST:
         item = findItem(state, payload.itemId);
         entry = findEntry(item, payload.entryId);
-        if (entry && !entry.hiddenAt) entry.quantity = Number(entry.quantity || 0) + Number(payload.delta || 0);
-        if (item) item.quantity = stockTotal(item);
+        if (entry && !entry.hiddenAt) {
+          entry.quantity = Number(entry.quantity || 0) + Number(payload.delta || 0);
+          bumpVersion(entry);
+        }
+        if (item) {
+          bumpVersion(item);
+          item.quantity = stockTotal(item);
+        }
         break;
       case OP_TYPES.LOCATIONS_PUT:
         state.segments = clone(payload.segments || {});
         state.coordinates = clone(payload.coordinates || {});
         state.spatialBackgroundImage = payload.spatialBackgroundImage || null;
+        state.meta.locationsVersion = Math.max(Number(state.meta.locationsVersion || 0) + 1, Number(op.baseVersion || 0) + 1);
         break;
       case OP_TYPES.CATEGORIES_PUT:
         state.categories = clone(payload.categories || {});
+        state.meta.categoriesVersion = Math.max(Number(state.meta.categoriesVersion || 0) + 1, Number(op.baseVersion || 0) + 1);
         break;
       case OP_TYPES.HOUSEHOLD_SETTINGS_PUT:
         state.users = clone(payload.users || ['Default']);
         state.userEmails = clone(payload.userEmails || {});
         state.reminderDays = Number(payload.reminderDays || 30);
+        state.meta.householdSettingsVersion = Math.max(Number(state.meta.householdSettingsVersion || 0) + 1, Number(op.baseVersion || 0) + 1);
         break;
     }
     return state;
   }
 
+  function isProjectedStatus(status) {
+    return !status || ['pending', 'retry', 'conflict', 'blocked'].indexOf(status) !== -1;
+  }
+
   function projectState(canonical, operations) {
     var projected = clone(canonical || {});
     sortOperations((operations || []).filter(function(op) {
-      return !op.status || ['pending', 'retry', 'conflict', 'blocked'].indexOf(op.status) !== -1;
+      return isProjectedStatus(op.status);
     })).forEach(function(op) {
       applyProjectedOperation(projected, op);
     });
@@ -348,16 +386,41 @@
 
   function latestDependency(ops, entityType, entityId) {
     var matching = (ops || []).filter(function(op) {
-      return op.entityType === entityType && op.entityId === entityId &&
-        ['pending', 'retry'].indexOf(op.status || 'pending') !== -1;
+      return op.entityType === entityType && op.entityId === entityId && isProjectedStatus(op.status);
     }).sort(operationOrder);
     return matching.length ? matching[matching.length - 1] : null;
+  }
+
+  function affectsItem(op, itemId) {
+    if (!op) return false;
+    if (op.entityType === 'item' && op.entityId === itemId) return true;
+    return !!(op.payload && op.payload.itemId === itemId);
+  }
+
+  function latestItemDependency(ops, itemId) {
+    var matching = (ops || []).filter(function(op) {
+      return affectsItem(op, itemId) && isProjectedStatus(op.status);
+    }).sort(operationOrder);
+    return matching.length ? matching[matching.length - 1] : null;
+  }
+
+  function selectPushBatch(operations, endpoint, processed, maxOperations) {
+    processed = processed || {};
+    var limit = Math.max(1, Number(maxOperations || 100));
+    return sortOperations((operations || []).filter(function(op) {
+      return op && op.syncEndpoint === endpoint &&
+        ['pending', 'retry'].indexOf(op.status || 'pending') >= 0 &&
+        !processed[op.opId];
+    })).slice(0, limit);
   }
 
   function nextBaseVersion(serverVersion, dependency) {
     if (!dependency) return Number(serverVersion || 0);
     if (dependency.type === OP_TYPES.STOCK_ADJUST) return Number(serverVersion || 0);
-    return Number(dependency.baseVersion || serverVersion || 0) + 1;
+    var dependencyBase = dependency.baseVersion !== undefined && dependency.baseVersion !== null
+      ? Number(dependency.baseVersion)
+      : Number(serverVersion || 0);
+    return dependencyBase + 1;
   }
 
   function operationResultAction(result) {
@@ -369,10 +432,27 @@
     return 'retry';
   }
 
+  function descendantIds(operations, rootId) {
+    var found = {};
+    found[rootId] = true;
+    var changed = true;
+    while (changed) {
+      changed = false;
+      (operations || []).forEach(function(op) {
+        if (op && op.opId && op.dependsOnOpId && found[op.dependsOnOpId] && !found[op.opId]) {
+          found[op.opId] = true;
+          changed = true;
+        }
+      });
+    }
+    return Object.keys(found);
+  }
+
   return {
     PROTOCOL_VERSION: PROTOCOL_VERSION,
     OP_TYPES: OP_TYPES,
     clone: clone,
+    stableStringify: stableStringify,
     stockTotal: stockTotal,
     findItem: findItem,
     findEntry: findEntry,
@@ -390,7 +470,10 @@
     applyProjectedOperation: applyProjectedOperation,
     projectState: projectState,
     latestDependency: latestDependency,
+    latestItemDependency: latestItemDependency,
+    selectPushBatch: selectPushBatch,
     nextBaseVersion: nextBaseVersion,
-    operationResultAction: operationResultAction
+    operationResultAction: operationResultAction,
+    descendantIds: descendantIds
   };
 });
