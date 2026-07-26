@@ -68,13 +68,32 @@
         var originalOnload = reader.onload;
         reader.onload = function(loadEvent) {
           var returned;
+          var importCommitted = false;
+          var originalSave = window.saveStateToLocalStorage;
+
+          // The legacy importer mutates appState while parsing and calls
+          // saveStateToLocalStorage only after the workbook has been accepted.
+          // Observe that commit point so a thrown parse/validation error cannot
+          // enqueue and upload a partially mutated in-memory workbook.
+          if (typeof originalSave === 'function') {
+            window.saveStateToLocalStorage = function() {
+              importCommitted = true;
+              return originalSave.apply(this, arguments);
+            };
+          }
+
           try {
             if (originalOnload) returned = originalOnload.call(reader, loadEvent);
           } finally {
-            enqueueImportDiff(beforeState, clone(window.appState || appState || {})).catch(function(error) {
-              console.error('[SyncV3] Excel import sync queueing failed:', error);
-              if (typeof showToast === 'function') showToast('Import saved locally, but synchronization queueing failed: ' + error.message, 'error');
-            });
+            if (typeof originalSave === 'function') window.saveStateToLocalStorage = originalSave;
+            if (importCommitted) {
+              enqueueImportDiff(beforeState, clone(window.appState || appState || {})).catch(function(error) {
+                console.error('[SyncV3] Excel import sync queueing failed:', error);
+                if (typeof showToast === 'function') showToast('Import saved locally, but synchronization queueing failed: ' + error.message, 'error');
+              });
+            } else {
+              console.warn('[SyncV3] Excel import did not reach its persistence point; no synchronization operations were queued.');
+            }
           }
           return returned;
         };
