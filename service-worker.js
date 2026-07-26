@@ -5,20 +5,14 @@
  * returns a deterministic concatenation of app.js and the protocol-v3 modules
  * so overrides are installed synchronously before DOMContentLoaded.
  */
-const CACHE_VERSION = 'v6-sync3-review2';
+const CACHE_VERSION = 'v7-sync3-review2';
 const APP_SHELL_CACHE = 'fmi-shell-' + CACHE_VERSION;
 const STATIC_CACHE = 'fmi-static-' + CACHE_VERSION;
 const CDN_CACHE = 'fmi-cdn-' + CACHE_VERSION;
 
 const APP_SHELL = [
-  './',
-  './index.html',
-  './style.css',
-  './app.js',
-  './sync-v3-core.js',
-  './sync-v3.js',
-  './sync-v3-import-adapter.js',
-  './manifest.json'
+  './', './index.html', './style.css', './app.js', './sync-v3-core.js', './sync-v3.js',
+  './sync-v3-import-adapter.js', './sync-v3-endpoint-guard.js', './manifest.json'
 ];
 
 const CDN_URLS = [
@@ -30,19 +24,16 @@ const CDN_URLS = [
 
 self.addEventListener('install', function(event) {
   event.waitUntil(
-    caches.open(APP_SHELL_CACHE).then(function(cache) {
-      return cache.addAll(APP_SHELL);
-    }).then(function() {
-      return caches.open(CDN_CACHE).then(function(cache) {
-        return Promise.allSettled(CDN_URLS.map(function(url) {
-          return fetch(url, { mode: 'no-cors' }).then(function(response) {
-            if (response.ok || response.type === 'opaque') return cache.put(url, response);
-          }).catch(function() {});
-        }));
-      });
-    }).then(function() {
-      return self.skipWaiting();
-    })
+    caches.open(APP_SHELL_CACHE).then(function(cache) { return cache.addAll(APP_SHELL); })
+      .then(function() {
+        return caches.open(CDN_CACHE).then(function(cache) {
+          return Promise.allSettled(CDN_URLS.map(function(url) {
+            return fetch(url, { mode: 'no-cors' }).then(function(response) {
+              if (response.ok || response.type === 'opaque') return cache.put(url, response);
+            }).catch(function() {});
+          }));
+        });
+      }).then(function() { return self.skipWaiting(); })
   );
 });
 
@@ -50,29 +41,20 @@ self.addEventListener('activate', function(event) {
   event.waitUntil(
     caches.keys().then(function(keys) {
       return Promise.all(keys.filter(function(key) {
-        return key.indexOf('fmi-') === 0 &&
-          key !== APP_SHELL_CACHE && key !== STATIC_CACHE && key !== CDN_CACHE;
-      }).map(function(key) {
-        return caches.delete(key);
-      }));
-    }).then(function() {
-      return self.clients.claim();
-    })
+        return key.indexOf('fmi-') === 0 && key !== APP_SHELL_CACHE && key !== STATIC_CACHE && key !== CDN_CACHE;
+      }).map(function(key) { return caches.delete(key); }));
+    }).then(function() { return self.clients.claim(); })
   );
 });
 
 function networkThenCache(request, cacheName) {
   return fetch(request).then(function(response) {
     if (response && response.ok) {
-      caches.open(cacheName).then(function(cache) {
-        cache.put(request, response.clone());
-      });
+      caches.open(cacheName).then(function(cache) { cache.put(request, response.clone()); });
       return response;
     }
     throw new Error('Network response unavailable');
-  }).catch(function() {
-    return caches.match(request);
-  });
+  }).catch(function() { return caches.match(request); });
 }
 
 function getScriptText(path) {
@@ -88,18 +70,17 @@ function bundledAppResponse() {
     getScriptText('./app.js'),
     getScriptText('./sync-v3-core.js'),
     getScriptText('./sync-v3.js'),
-    getScriptText('./sync-v3-import-adapter.js')
+    getScriptText('./sync-v3-import-adapter.js'),
+    getScriptText('./sync-v3-endpoint-guard.js')
   ]).then(function(parts) {
     var source = parts[0] +
       '\n;/* bundled sync-v3-core.js */\n' + parts[1] +
       '\n;/* bundled sync-v3.js */\n' + parts[2] +
-      '\n;/* bundled sync-v3-import-adapter.js */\n' + parts[3] + '\n';
+      '\n;/* bundled sync-v3-import-adapter.js */\n' + parts[3] +
+      '\n;/* bundled sync-v3-endpoint-guard.js */\n' + parts[4] + '\n';
     return new Response(source, {
       status: 200,
-      headers: {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'no-cache'
-      }
+      headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }
     });
   }).catch(function(error) {
     return new Response('console.error(' + JSON.stringify('[SW] Application bundle unavailable: ' + error.message) + ');', {
@@ -119,20 +100,13 @@ self.addEventListener('fetch', function(event) {
   }
 
   if (CDN_URLS.some(function(cdn) {
-    return url.href.indexOf(cdn) === 0 ||
-      url.href.replace(/@[\d.]+/g, '').indexOf(cdn.replace(/@[\d.]+/g, '')) === 0;
+    return url.href.indexOf(cdn) === 0 || url.href.replace(/@[\d.]+/g, '').indexOf(cdn.replace(/@[\d.]+/g, '')) === 0;
   })) {
     event.respondWith(caches.match(event.request).then(function(cached) {
       var network = fetch(event.request).then(function(response) {
-        if (response && response.status === 200) {
-          caches.open(CDN_CACHE).then(function(cache) {
-            cache.put(event.request, response.clone());
-          });
-        }
+        if (response && response.status === 200) caches.open(CDN_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
         return response;
-      }).catch(function() {
-        return cached;
-      });
+      }).catch(function() { return cached; });
       return cached || network;
     }));
     return;
@@ -140,26 +114,18 @@ self.addEventListener('fetch', function(event) {
 
   if (event.request.mode === 'navigate') {
     event.respondWith(fetch(event.request).then(function(response) {
-      if (response && response.ok) {
-        caches.open(APP_SHELL_CACHE).then(function(cache) {
-          cache.put('./index.html', response.clone());
-        });
-      }
+      if (response && response.ok) caches.open(APP_SHELL_CACHE).then(function(cache) { cache.put('./index.html', response.clone()); });
       return response;
     }).catch(function() {
       return caches.match('./index.html').then(function(cached) {
         if (cached) return cached;
-        return caches.match('./').then(function(root) {
-          return root || new Response('Offline', { status: 503 });
-        });
+        return caches.match('./').then(function(root) { return root || new Response('Offline', { status: 503 }); });
       });
     }));
     return;
   }
 
-  if (APP_SHELL.some(function(path) {
-    return url.pathname.endsWith(path.replace('./', ''));
-  })) {
+  if (APP_SHELL.some(function(path) { return url.pathname.endsWith(path.replace('./', '')); })) {
     event.respondWith(caches.match(event.request).then(function(cached) {
       return cached || networkThenCache(event.request, APP_SHELL_CACHE);
     }));
@@ -168,15 +134,9 @@ self.addEventListener('fetch', function(event) {
 
   event.respondWith(caches.match(event.request).then(function(cached) {
     var network = fetch(event.request).then(function(response) {
-      if (response && response.ok) {
-        caches.open(STATIC_CACHE).then(function(cache) {
-          cache.put(event.request, response.clone());
-        });
-      }
+      if (response && response.ok) caches.open(STATIC_CACHE).then(function(cache) { cache.put(event.request, response.clone()); });
       return response;
-    }).catch(function() {
-      return cached;
-    });
+    }).catch(function() { return cached; });
     return cached || network;
   }));
 });
