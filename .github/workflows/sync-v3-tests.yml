@@ -1,0 +1,47 @@
+name: Sync v3 tests
+
+on:
+  push:
+    branches:
+      - main
+      - 'agent/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check synchronization files
+        run: |
+          node --check sync-v3-core.js
+          node --check sync-v3.js
+          node --check sync-v3-import-adapter.js
+          node --check sync-v3-endpoint-guard.js
+          node --check sync-v3-mutation-guard.js
+          node --check service-worker.js
+          cp GoogleSheetSync.gs /tmp/GoogleSheetSync.js
+          node --check /tmp/GoogleSheetSync.js
+      - name: Run browser sync core tests
+        run: node tests/sync-v3-core.test.js
+      - name: Run browser sync integration tests
+        run: node tests/sync-v3-browser-integration.test.js
+      - name: Run mutation baseline guard tests
+        run: node tests/sync-v3-mutation-guard.test.js
+      - name: Run Excel import adapter tests
+        run: node tests/sync-v3-import-adapter.test.js
+      - name: Run endpoint guard tests
+        run: node tests/sync-v3-endpoint-guard.test.js
+      - name: Run service-worker routing tests
+        run: node tests/service-worker-routing.test.js
+      - name: Run Apps Script sync tests
+        run: |
+          cp GoogleSheetSync.gs GoogleSheetSync.js
+          node tests/google-sheet-sync-v3.test.js
+          rm GoogleSheetSync.js
